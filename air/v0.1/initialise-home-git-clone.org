@@ -1,0 +1,270 @@
+#+title: Initialise home-git-clone
+#+state: complete
+#+FILETAGS: :nix:home-manager:git:vcs:
+#+date: 2026-01-05
+
+* Summary
+
+This document covers the complete implementation of home-git-clone, a Nix Home Manager module for declarative repository management. The module eliminates manual git clone operations through declarative configuration, allowing users to specify repositories in their Nix configuration that are automatically cloned and managed during home-manager activation.
+
+* Motivation
+
+** Problem
+
+Manual repository cloning across multiple environments is error-prone and repetitive. Users must remember which repositories to clone, where to place them, and how to keep them updated. This manual process doesn't integrate with Nix's declarative philosophy and lacks rollback capabilities.
+
+** Solution
+
+A Nix Home Manager module that integrates with the activation system, providing declarative repository management. Users specify repositories once in their Nix configuration, and the module handles cloning, placement, and optional updates automatically.
+
+** Goals
+
+- Declarative repository management via Nix configuration
+- Support for Git via ~home.gitClone~
+- Support for Jujutsu via dedicated ~home.jjClone~ option
+- Worktree-friendly directory structures (Git) and workspace support (Jujutsu)
+- Smart HTTPS handling to prevent config rewrites
+- Multi-user safety with per-user credentials
+- Optional auto-update on activation
+- Idempotent operations (safe to run repeatedly)
+
+** Non-Goals
+
+- Not a Git hosting solution
+- Not a substitute for proper Git workflow
+- Not meant to manage system-wide repositories (only user home directories)
+- No repository content validation or security scanning
+- No automatic conflict resolution for local changes
+
+* Proposal
+
+** Configuration Schema
+
+The module provides a ~home.gitClone~ option that accepts an attribute set of repository configurations:
+
+#+begin_src nix
+home.gitClone.<relative-path> = {
+  url = string;              # Required: Git repository URL
+  rev = string?;             # Default: null - auto-detects default branch
+                             # Set explicitly for specific branch (e.g., "main", "master")
+                             # Required when useWorktree = true
+  useWorktree = bool;        # Default: false - append rev to path
+  bypassGitConfig = bool?;   # Default: null - auto-detect HTTPS
+  update = bool;             # Default: false - pull updates on activation
+}
+
+home.jjClone.<relative-path> = {
+  url = string;              # Required: Git repository URL
+  rev = string?;             # Default: null - auto-detects default branch
+  colocate = bool;           # Default: true - create .git directory
+  useWorkspace = bool;       # Default: false - append rev to path
+  bypassGitConfig = bool?;   # Default: null - auto-detect HTTPS
+  update = bool;             # Default: false - fetch updates on activation
+}
+#+end_src
+
+** Integration with Home Manager
+
+The module integrates with Home Manager's activation system, generating activation scripts that run during ~home-manager switch~. Each repository gets its own activation entry that:
+
+1. Checks if the repository already exists
+2. Clones if missing (or updates if ~update = true~)
+3. Uses the user's credentials (SSH keys, GPG agent)
+4. Respects idempotency (doesn't re-clone existing repos)
+
+** SSH Authentication
+
+The module automatically detects and uses GPG agent SSH socket (~/.gnupg/S.gpg-agent.ssh) when available, enabling SSH authentication without additional configuration.
+
+* Design Details
+
+** Module Structure
+
+1. *flake.nix*: Exposes homeManagerModules outputs (~default~ and ~git-clone~), imports ~./nix~
+2. *nix/default.nix*: Main module implementation
+   - Options declaration with type checking (~home.gitClone~, ~home.jjClone~)
+   - Wires up activation script generators
+3. *nix/git-clone.nix*: Git clone activation script generator
+4. *nix/jj-clone.nix*: Jujutsu clone activation script generator
+5. *nix/helpers.nix*: Shared helpers (GPG agent setup, branch auto-detection)
+
+** Configuration Schema Implementation
+
+Uses Nix module system for type-safe configuration:
+
+- ~lib.types.attrsOf~ for the repository sets
+- ~lib.types.submodule~ for individual repository options
+- ~lib.types.nullOr types.str~, ~lib.types.bool~ for option values
+- Smart defaults: ~rev = null~ (auto-detect), ~useWorktree/useWorkspace = false~, ~colocate = true~
+
+** Activation Script Generation
+
+For each repository, the module generates a bash activation script that:
+
+1. *Sets up environment*:
+   - Adds openssh, git, and optionally jujutsu to PATH
+   - Configures SSH_AUTH_SOCK from GPG agent if available
+
+2. *Auto-detects default branch (if rev is null)*:
+   - Runs ~git ls-remote --symref <url> HEAD~ to query remote
+   - Extracts default branch from symbolic ref
+   - Falls back to "main" if detection fails
+   - Skipped if rev is explicitly set
+
+3. *Creates parent directories*:
+   - Uses ~mkdir -p~ to ensure parent path exists
+   - Handles worktree mode by appending rev to path
+
+4. *VCS operations*:
+   - *home.gitClone*: Git clone: ~git clone --branch <rev> <url> <path>~, update: ~git pull~
+   - *home.jjClone*: Jujutsu clone: ~jj git clone --colocate --branch <rev> <url> <path>~, update: ~jj git fetch~
+
+5. *Idempotency check*:
+   - Checks for .git or .jj directory before cloning
+   - Only clones if repository doesn't exist
+   - Updates only if ~update = true~
+
+** HTTPS Config Bypass
+
+One of the key features is smart HTTPS handling:
+
+#+begin_src nix
+shouldBypassConfig =
+  (cfg.bypassGitConfig == true) ||
+  (cfg.bypassGitConfig == null && lib.hasPrefix "https://" cfg.url);
+#+end_src
+
+When bypassing git config:
+- Sets ~GIT_CONFIG_GLOBAL=/dev/null~
+- Sets ~GIT_CONFIG_SYSTEM=/dev/null~
+- Prevents ~/.gitconfig from rewriting HTTPS to SSH
+
+*Use case*: User has ~url.git@github.com:.insteadOf = https://github.com/~ in their gitconfig. Without bypass, HTTPS URLs would be rewritten to SSH. With bypass, HTTPS URLs stay as HTTPS.
+
+** VCS Support
+
+The module provides two separate options for different version control systems:
+
+*home.gitClone* (Git repositories):
+- Clone command: ~git clone --branch <rev> <url> <path>~
+- Update command: ~git pull~
+- Existence check: ~[ -d <path>/.git ]~
+- Options: url, rev, useWorktree, bypassGitConfig, update
+
+*home.jjClone* (Jujutsu repositories):
+- Clone command: ~jj git clone --colocate --branch <rev> <url> <path>~
+- Update command: ~jj git fetch~
+- Existence check: ~[ -d <path>/.jj ]~
+- Co-location: Creates both .jj and .git directories by default
+- Options: url, rev, colocate, useWorkspace, bypassGitConfig, update
+
+** Worktree Mode
+
+When ~useWorktree = true~:
+- Path becomes ~<configured-path>/<rev>/~
+- Example: ~home.gitClone."Coding/my-repo"~ with ~rev = "main"~ creates ~~/Coding/my-repo/main/~
+- *Important*: ~rev~ must be explicitly set when using worktree mode (cannot auto-detect, as path needs to be known at Nix evaluation time)
+- Enables easy sibling worktree creation:
+  #+begin_src bash
+  cd ~/Coding/my-repo/main
+  git worktree add ../develop
+  git worktree add ../feature-branch
+  #+end_src
+
+** Default Branch Auto-Detection
+
+When ~rev~ is not specified (null):
+- Module queries the remote repository for its default branch
+- Uses ~git ls-remote --symref <url> HEAD~ to detect the symbolic reference
+- Works with any default branch name: main, master, develop, trunk, etc.
+- Falls back to "main" if detection fails (network issues, authentication problems)
+- Detection happens at activation time (when cloning), not Nix evaluation time
+- Adds one extra network call per repository on first clone
+- *Limitation*: Cannot be used with ~useWorktree = true~ (rev must be explicit for path construction)
+
+* Test Plan
+
+The implementation has been tested with:
+
+1. *Flakes and non-Flakes setup*: Both installation methods work correctly
+2. *SSH and HTTPS authentication*: Both URL types clone successfully
+3. *Worktree mode*: Directory structure created correctly with rev appended
+4. *Jujutsu integration*: Co-located repos work with both jj and git commands
+5. *Multi-user scenarios*: Each user's credentials respected
+6. *Auto-update functionality*: ~update = true~ pulls latest changes on activation
+7. *HTTPS config bypass*: Prevents SSH rewrites for HTTPS URLs
+8. *GPG agent integration*: SSH socket detected and used when available
+
+** Test Scenarios
+
+- First-time clone (no existing repository)
+- Existing repository (should skip cloning)
+- Update mode with upstream changes
+- Multiple repositories in different paths
+- SSH URLs with GPG agent authentication
+- HTTPS URLs with git config that rewrites to SSH
+- Auto-detection of default branch (with repos using "main", "master", etc.)
+- Explicit rev override with auto-detection available
+- Worktree mode with explicit rev (auto-detection disabled)
+- Fallback to "main" when auto-detection fails
+
+* Infrastructure Needed
+
+** Required
+
+- Nix with Flakes support (for Flakes-based installation)
+- Home Manager (framework for module)
+- Git (always required, even for jj repos)
+
+** Optional
+
+- Jujutsu (only needed when using ~home.jjClone~)
+- GPG agent with SSH support (for SSH authentication)
+- ssh-agent (fallback if GPG agent not available)
+
+* Drawbacks
+
+1. *Full history clones*: No shallow clone support, may be slow for large repos
+2. *No automatic conflict resolution*: If ~update = true~ and user has local changes, git pull may fail
+3. *No parallel cloning*: Repositories clone sequentially during activation
+4. *Update mode limitations*: Users must manually resolve conflicts if updates fail
+
+* Alternatives
+
+** Manual git clone commands
+
+- Pro: Simple, direct control
+- Con: Not declarative, error-prone, no rollback
+- Rejected: Doesn't fit Nix philosophy
+
+** Shell scripts in home.activation
+
+- Pro: More flexible than manual commands
+- Con: Not integrated with Nix type system, no validation
+- Rejected: Module provides type safety and better UX
+
+** System-level repository management
+
+- Pro: Could manage system-wide repositories
+- Con: Doesn't respect user boundaries, permissions issues
+- Rejected: Home Manager is user-focused
+
+** Git submodules
+
+- Pro: Native Git feature
+- Con: Complex, not suitable for home directory management
+- Rejected: Not designed for this use case
+
+* History
+
+- 2026-01-05: Initial implementation and Air documentation completed
+
+* References
+
+- [[file:../README.org][README.org]]: User-facing documentation
+- [[file:../nix/default.nix][nix/default.nix]]: Main module implementation
+- [[file:../nix/git-clone.nix][nix/git-clone.nix]]: Git clone script generator
+- [[file:../nix/jj-clone.nix][nix/jj-clone.nix]]: Jujutsu clone script generator
+- [[file:../nix/helpers.nix][nix/helpers.nix]]: Shared helper functions
+- [[https://nix-community.github.io/home-manager/][Home Manager documentation]]
+- [[https://github.com/martinvonz/jj][Jujutsu VCS documentation]]

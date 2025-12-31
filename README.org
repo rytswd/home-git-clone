@@ -1,0 +1,517 @@
+#+TITLE: home-git-clone
+#+AUTHOR: rytswd
+#+OPTIONS: toc:3 num:nil ^:nil
+
+#+html:<div align="center">
+#+html:<p>Declaratively clone and manage Git/Jujutsu repositories with Home Manager</p>
+#+html:<p>
+#+html:<img src="https://img.shields.io/badge/home--manager-gray?style=flat-square&logo=nixos" alt="Home Manager module">
+#+html:<a href="https://github.com/rytswd/home-git-clone"><img src="https://img.shields.io/badge/Source-grey?style=flat-square&logo=github" alt="GitHub Source"></a>
+#+html:<img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="MIT License">
+#+html:</p>
+#+html:</div>
+
+-----
+
+** 🌄 Overview
+
+*home-git-clone* is a [[https://github.com/nix-community/home-manager][Home Manager]] module that lets you define repositories in your Nix configuration and have them automatically cloned during ~home-manager switch~.
+
+*Instead of running this on every machine...*
+
+#+begin_src bash
+git clone git@github.com:user/dotfiles.git ~/Coding/dotfiles
+git clone git@github.com:user/project.git ~/Coding/project
+#+end_src
+
+*Just declare this once:*
+
+#+begin_src nix
+home.gitClone."Coding/dotfiles".url = "git@github.com:user/dotfiles.git";
+home.gitClone."Coding/project".url = "git@github.com:user/project.git";
+#+end_src
+
+Run ~home-manager switch~ and your repositories appear. *Define once, deploy everywhere.*
+
+** ✨ Features
+
+- *Declarative* — Define repositories in Nix, clone automatically
+- *Auto Default Branch* — Detects "main" vs "master" automatically
+- *Git + Jujutsu* — Full support for both VCS systems
+- *Worktree Ready* — Optional path structure for easy worktree workflows
+- *Smart HTTPS* — Bypasses git config rewrites for HTTPS URLs
+- *Auto-Update* — Optionally pull/fetch on every activation
+- *Multi-User Safe* — Each user's credentials, isolated operations
+- *GPG Agent* — Automatic SSH socket detection
+
+** 🚀 Quick Start
+
+*** 1. Add the Module
+
+**** Using Flakes (Recommended)
+
+#+begin_src nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    home-manager.url = "github:nix-community/home-manager";
+    home-git-clone.url = "github:rytswd/home-git-clone";
+  };
+
+  outputs = { nixpkgs, home-manager, home-git-clone, ... }: {
+    homeConfigurations.youruser = home-manager.lib.homeManagerConfiguration {
+      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      modules = [
+        home-git-clone.homeManagerModules.default
+        ./home.nix
+      ];
+    };
+  };
+}
+#+end_src
+
+**** Without Flakes
+
+#+begin_src nix
+# home.nix or configuration.nix
+{ config, pkgs, ... }:
+{
+  imports = [
+    (builtins.fetchGit {
+      url = "https://github.com/rytswd/home-git-clone.git";
+      ref = "main";
+    } + "/nix")
+  ];
+}
+#+end_src
+
+*** 2. Configure Repositories
+
+#+begin_src nix
+# home.nix
+{
+  home.gitClone = {
+    "Coding/dotfiles" = {
+      url = "git@github.com:user/dotfiles.git";
+    };
+  };
+}
+#+end_src
+
+*** 3. Activate
+
+#+begin_src bash
+home-manager switch
+#+end_src
+
+Your repository is now at =~/Coding/dotfiles/=.
+
+** 📖 Usage Guide
+
+*** Git Examples
+
+#+html:<details>
+#+html:<summary><strong>Basic Clone</strong> — Simplest configuration with auto-detected branch</summary>
+
+#+begin_src nix
+home.gitClone = {
+  "Coding/my-project" = {
+    url = "git@github.com:user/project.git";
+  };
+};
+#+end_src
+
+#+begin_example
+Result: ~/Coding/my-project/
+#+end_example
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>Specific Branch</strong> — Clone a specific branch instead of default</summary>
+
+#+begin_src nix
+home.gitClone = {
+  "Coding/my-project" = {
+    url = "git@github.com:user/project.git";
+    rev = "develop";
+  };
+};
+#+end_src
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>HTTPS Repository</strong> — Public repos without SSH keys</summary>
+
+HTTPS URLs work seamlessly. Git config rewrites are automatically bypassed.
+
+#+begin_src nix
+home.gitClone = {
+  "Tools/public-repo" = {
+    url = "https://github.com/user/repo.git";
+  };
+};
+#+end_src
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>Auto-Update</strong> — Pull latest on every activation</summary>
+
+Pull latest changes every time you run ~home-manager switch~.
+
+#+begin_src nix
+home.gitClone = {
+  "Coding/always-fresh" = {
+    url = "git@github.com:user/repo.git";
+    update = true;
+  };
+};
+#+end_src
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>Worktree Mode</strong> — Structure for git worktree workflows</summary>
+
+Appends the branch name to the path, perfect for Git worktree workflows.
+
+#+begin_src nix
+home.gitClone = {
+  "Coding/my-project" = {
+    url = "git@github.com:user/project.git";
+    rev = "main";
+    useWorktree = true;
+  };
+};
+#+end_src
+
+#+begin_example
+Result: ~/Coding/my-project/main/
+#+end_example
+
+Add more worktrees easily:
+
+#+begin_src bash
+cd ~/Coding/my-project/main
+git worktree add ../develop
+git worktree add ../feature-x
+#+end_src
+
+#+begin_example
+~/Coding/my-project/
+  |-- main/        # Created by home-git-clone
+  |-- develop/     # Added manually
+  +-- feature-x/   # Added manually
+#+end_example
+
+#+html:</details>
+
+*** Jujutsu Examples
+
+Use ~home.jjClone~ for Jujutsu-native workflows.
+
+#+html:<details>
+#+html:<summary><strong>Basic Clone</strong> — Git-colocated by default</summary>
+
+Creates a Git-colocated repository by default (both =.git= and =.jj= directories).
+
+#+begin_src nix
+home.jjClone = {
+  "Coding/jj-repo" = {
+    url = "git@github.com:user/repo.git";
+  };
+};
+#+end_src
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>Pure Jujutsu</strong> — Non-colocated, no .git directory</summary>
+
+No =.git= directory, pure Jujutsu only.
+
+#+begin_src nix
+home.jjClone = {
+  "Coding/pure-jj" = {
+    url = "git@github.com:user/repo.git";
+    colocate = false;
+  };
+};
+#+end_src
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>Auto-Update</strong> — Fetch latest on every activation</summary>
+
+#+begin_src nix
+home.jjClone = {
+  "Coding/jj-fresh" = {
+    url = "git@github.com:user/repo.git";
+    update = true;  # Runs: jj git fetch
+  };
+};
+#+end_src
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>Workspace Mode</strong> — Structure for jj workspace workflows</summary>
+
+#+begin_src nix
+home.jjClone = {
+  "Coding/jj-workspaces" = {
+    url = "git@github.com:user/repo.git";
+    rev = "main";
+    useWorkspace = true;
+  };
+};
+#+end_src
+
+#+begin_example
+Result: ~/Coding/jj-workspaces/main/
+#+end_example
+
+Add more workspaces:
+
+#+begin_src bash
+cd ~/Coding/jj-workspaces/main
+jj workspace add ../develop
+#+end_src
+
+#+html:</details>
+
+*** Symlinking Files
+
+Since repositories are cloned directly to your home directory (outside the Nix store), you can symlink files or directories from them using ~config.lib.file.mkOutOfStoreSymlink~.
+
+This is particularly useful for managing configuration files:
+
+#+begin_src nix
+{ config, ... }: {
+  home.gitClone."Coding/dotfiles" = {
+    url = "git@github.com:user/dotfiles.git";
+  };
+
+  # Link a directory from the cloned repo to ~/.config
+  home.file.".config/nvim".source =
+    config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/Coding/dotfiles/nvim";
+}
+#+end_src
+
+** 📋 Configuration Reference
+
+*** home.gitClone.<path>
+
+| Option            | Type             | Default | Description                                      |
+|-------------------+------------------+---------+--------------------------------------------------|
+| ~url~             | string           | /required/ | Repository URL (SSH or HTTPS)                    |
+| ~rev~             | string or null   | ~null~  | Branch/revision. Auto-detects if null.           |
+| ~useWorktree~     | bool             | ~false~ | Append rev to path for worktree structure        |
+| ~bypassGitConfig~ | bool or null     | ~null~  | Override git config bypass (auto for HTTPS)      |
+| ~update~          | bool             | ~false~ | Pull on every activation                         |
+
+*** home.jjClone.<path>
+
+| Option            | Type             | Default | Description                                      |
+|-------------------+------------------+---------+--------------------------------------------------|
+| ~url~             | string           | /required/ | Repository URL (SSH or HTTPS)                    |
+| ~rev~             | string or null   | ~null~  | Branch/bookmark. Auto-detects if null.           |
+| ~colocate~        | bool             | ~true~  | Create Git-colocated repo (.git + .jj)           |
+| ~useWorkspace~    | bool             | ~false~ | Append rev to path for workspace structure       |
+| ~bypassGitConfig~ | bool or null     | ~null~  | Override git config bypass (auto for HTTPS)      |
+| ~update~          | bool             | ~false~ | Fetch on every activation (jj git fetch)         |
+
+** ⚙️ Advanced Usage
+
+#+html:<details>
+#+html:<summary><strong>Override Git Config Bypass</strong> — Control HTTPS/SSH rewriting behavior</summary>
+
+By default, HTTPS URLs bypass your git config to prevent =url.*.insteadOf= rewrites. Override this behavior:
+
+#+begin_src nix
+home.gitClone = {
+  # Force bypass even for SSH
+  "special/repo1" = {
+    url = "git@github.com:user/repo.git";
+    bypassGitConfig = true;
+  };
+
+  # Use git config even for HTTPS
+  "special/repo2" = {
+    url = "https://github.com/user/repo.git";
+    bypassGitConfig = false;
+  };
+};
+#+end_src
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>Multi-User Setup</strong> — Safe for shared systems</summary>
+
+Each user runs home-manager with their own credentials. Safe for shared systems.
+
+#+begin_src nix
+# User alice (SSH keys)
+home.gitClone = {
+  "Work/private" = {
+    url = "git@github.com:company/private.git";
+  };
+};
+
+# User bob (HTTPS only)
+home.gitClone = {
+  "Projects/public" = {
+    url = "https://github.com/user/public.git";
+  };
+};
+#+end_src
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>Combining Git and Jujutsu</strong> — Use both in the same config</summary>
+
+Use both module types in the same configuration:
+
+#+begin_src nix
+{
+  # Standard Git repositories
+  home.gitClone = {
+    "Coding/legacy-project" = {
+      url = "git@github.com:user/legacy.git";
+    };
+  };
+
+  # Jujutsu repositories
+  home.jjClone = {
+    "Coding/modern-project" = {
+      url = "git@github.com:user/modern.git";
+    };
+  };
+}
+#+end_src
+
+#+html:</details>
+
+** 🔧 How It Works
+
+#+begin_example
+  ┌─────────────────────────────────┐
+  │  Your Nix Configuration         │
+  │  (home.nix / flake.nix)         │
+  └───────────────┬─────────────────┘
+                  │
+                  ▼
+  ┌─────────────────────────────────┐
+  │  home.gitClone = { ... }        │
+  │  home.jjClone  = { ... }        │
+  └───────────────┬─────────────────┘
+                  │
+                  ▼
+  ┌─────────────────────────────────┐
+  │  Home Manager Module            │
+  │  Validates config, generates    │
+  │  activation scripts per-repo    │
+  └───────────────┬─────────────────┘
+                  │
+                  ▼
+  ┌─────────────────────────────────┐
+  │  $ home-manager switch          │
+  └───────────────┬─────────────────┘
+                  │
+                  ▼
+  ┌─────────────────────────────────┐
+  │  For each repository:           │
+  │  1. Check if already cloned     │
+  │  2. Auto-detect default branch  │
+  │  3. Setup SSH (GPG agent)       │
+  │  4. Clone or update             │
+  └───────────────┬─────────────────┘
+                  │
+                  ▼
+  ┌─────────────────────────────────┐
+  │  ✓ Repositories ready           │
+  │    ~/Coding/your-repos/         │
+  └─────────────────────────────────┘
+#+end_example
+
+*** Key Behaviors
+
+| Behavior        | Description                                              |
+|-----------------+----------------------------------------------------------|
+| *Idempotent*    | Safe to run repeatedly — existing repos left untouched   |
+| *SSH Detection* | Auto-uses GPG agent socket at =~/.gnupg/S.gpg-agent.ssh= |
+| *HTTPS Bypass*  | Prevents =url.*.insteadOf= rewrites for HTTPS URLs       |
+| *Update Mode*   | Only fetches/pulls when =update = true=                  |
+| *Parallel Safe* | Multiple repos clone independently                       |
+
+** ⚠️ Known Limitations
+
+*** No Automatic Deletion
+Removing a repository from your configuration *does not* delete the directory from your disk. This is a deliberate safety feature to prevent accidental data loss. You must manually remove the directory if it is no longer needed.
+
+*** No URL Validation on Existing Repos
+If the target directory already contains a Git repository, the module *assumes it is correct*. It does not validate that the local repository's remote URL matches the one specified in your configuration. This ensures that manually modified remotes (e.g., using different push URLs) are not overwritten or flagged as errors.
+
+*** Sequential Activation
+Cloning happens during the activation phase of Home Manager. If you are cloning many large repositories for the first time, ~home-manager switch~ will wait for all clones to complete before finishing.
+
+** 🔍 Troubleshooting
+
+#+html:<details>
+#+html:<summary><strong>Repository Not Cloning</strong></summary>
+
+1. Check if the directory already exists:
+#+begin_src bash
+   ls -la ~/path/to/repo
+#+end_src
+
+2. Remove and retry:
+#+begin_src bash
+   rm -rf ~/path/to/repo
+   home-manager switch
+#+end_src
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>SSH Authentication Fails</strong></summary>
+
+1. Verify your SSH agent:
+#+begin_src bash
+   ssh-add -l
+#+end_src
+
+2. Check GPG agent socket:
+#+begin_src bash
+   ls -la ~/.gnupg/S.gpg-agent.ssh
+#+end_src
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>HTTPS Being Rewritten to SSH</strong></summary>
+
+This happens when you have =url.*.insteadOf= in your git config. The module should bypass this automatically for HTTPS URLs. If not:
+
+#+begin_src nix
+home.gitClone."path" = {
+  url = "https://github.com/user/repo.git";
+  bypassGitConfig = true;  # Force bypass
+};
+#+end_src
+
+#+html:</details>
+
+** License
+
+MIT
+
+** Contributing
+
+Contributions are welcome! Please open an issue or pull request.

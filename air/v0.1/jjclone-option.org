@@ -1,0 +1,334 @@
+#+title: Add home.jjClone Option for Jujutsu-Specific Features
+#+state: complete
+#+FILETAGS: :nix:home-manager:jujutsu:vcs:feature:
+#+date: 2026-01-05
+
+* Summary
+
+Introduce ~home.jjClone~ as a dedicated configuration option for Jujutsu repositories, separate from ~home.gitClone~. This new option provides a cleaner interface for Jujutsu users while enabling future jj-specific features that don't fit into the generic Git workflow. Repositories default to Git-colocated mode (~--colocate~) for compatibility, but users can opt for pure Jujutsu repositories.
+
+* Motivation
+
+** Problem
+
+Jujutsu repositories require different configuration options than standard Git repositories (e.g., colocation control, bookmarks vs branches, change-ID management). Squeezing these into the existing ~home.gitClone~ option would pollute the interface and confuse users.
+
+** Solution
+
+A dedicated ~home.jjClone~ option provides:
+- *Cleaner interface* for Jujutsu users
+- *Room for jj-specific features*: Future options like ~bookmarks~, ~abandonOld~, ~colocate~ control
+- *Better discoverability*: Users searching for Jujutsu integration find ~home.jjClone~ clearly
+
+* Goals
+
+- Dedicated ~home.jjClone.<path>~ configuration option
+- Sensible defaults for Jujutsu workflows
+- Git-colocated by default (~--colocate~ flag) for compatibility
+- Feature parity with ~home.gitClone~ (workspace mode, auto-update, auto-detection)
+- Auto-detects remote default branch when rev not specified
+- Jujutsu-specific terminology: ~useWorkspace~ instead of ~useWorktree~
+- Room for future jj-specific options (bookmark tracking, change-id management)
+- Coexistence with ~home.gitClone~ (users can use both)
+
+* Non-Goals
+
+- Not replacing ~home.gitClone~ (both options coexist)
+- Not implementing advanced jj features yet (bookmarks, etc.) - just foundation
+
+* Proposal
+
+** Configuration Schema
+
+#+begin_src nix
+home.jjClone.<relative-path> = {
+  url = string;              # Required: Git/JJ repository URL
+  rev = string?;             # Default: null - auto-detects default branch
+                             # Set explicitly for specific branch (e.g., "main", "master")
+                             # Required when useWorkspace = true
+  colocate = bool;           # Default: true - create .git directory
+  useWorkspace = bool;       # Default: false - append rev to path
+  update = bool;             # Default: false - fetch updates on activation
+}
+#+end_src
+
+** Key Differences from home.gitClone
+
+1. *Dedicated Option*: `home.gitClone` handles Git, `home.jjClone` handles Jujutsu
+2. *~colocate~ option*: Explicit control over Git co-location (default: ~true~)
+3. *~useWorkspace~ instead of ~useWorktree~*: Uses Jujutsu terminology
+4. *Future extensibility*: Can add jj-specific options without affecting ~home.gitClone~
+
+** Implementation Approach
+
+Implemented as a separate module file (~nix/jj-clone.nix~) with option declaration in ~nix/default.nix~:
+
+#+begin_src nix
+options.home.jjClone = lib.mkOption {
+  type = lib.types.attrsOf jjRepoModule;
+  default = {};
+  description = "Jujutsu repositories to clone and manage";
+};
+#+end_src
+
+Activation scripts are generated with "jjClone-" prefix to avoid conflicts with "gitClone-" entries.
+
+* Design Details
+
+** Module Structure
+
+Implemented with separate files for clarity:
+
+1. *nix/default.nix*: Option declaration (~options.home.jjClone~) using same pattern as ~home.gitClone~
+2. *nix/jj-clone.nix*: Activation script generator with jj-specific commands
+3. *nix/helpers.nix*: Shared helpers (GPG agent, branch auto-detection)
+4. *Separate activation entries*: Named "jjClone-<path>" instead of "gitClone-<path>"
+
+** Activation Script
+
+Generated bash script structure (HTTPS URLs bypass git config since jj uses git underneath):
+
+#+begin_src bash
+# 1. Environment setup
+export PATH="${pkgs.jujutsu}/bin:${pkgs.git}/bin:${pkgs.openssh}/bin:$PATH"
+
+# 2. GPG agent SSH socket
+SSH_SOCKET="$HOME/.gnupg/S.gpg-agent.ssh"
+if [ -S "$SSH_SOCKET" ]; then
+  export SSH_AUTH_SOCK="$SSH_SOCKET"
+fi
+
+# 3. Auto-detect default branch (if rev is null)
+if [ -z "${cfg.rev}" ]; then
+  echo "Auto-detecting default branch for ${cfg.url}..."
+  DEFAULT_BRANCH=$(git ls-remote --symref "${cfg.url}" HEAD | \
+                   awk '/^ref:/ {sub(/refs\/heads\//, "", $2); print $2}')
+  if [ -z "$DEFAULT_BRANCH" ]; then
+    echo "Warning: Could not detect default branch, falling back to 'main'" >&2
+    DEFAULT_BRANCH="main"
+  fi
+  echo "Detected default branch: $DEFAULT_BRANCH"
+  REV="$DEFAULT_BRANCH"
+else
+  REV="${cfg.rev}"
+fi
+
+# 4. Directory creation
+$DRY_RUN_CMD mkdir -p "$(dirname "${repoPath}")"
+
+# 5. Repository operations
+if [ ! -d "${repoPath}/.jj" ]; then
+  # Clone with jj git clone
+  $DRY_RUN_CMD jj git clone --colocate --branch "$REV" "${cfg.url}" "${repoPath}"
+else
+  # Update if enabled
+  if [ "${cfg.update}" = "true" ]; then
+    $DRY_RUN_CMD sh -c "cd '${repoPath}' && jj git fetch"
+  fi
+fi
+#+end_src
+
+** Colocate Option
+
+- *Default: ~colocate = true~*: Creates both .jj and .git directories
+- *When false*: Pure jj repo (only .jj directory), omits ~--colocate~ flag
+
+** Workspace Mode
+
+Similar semantics to ~home.gitClone~'s worktree mode, but using Jujutsu terminology:
+
+- *useWorkspace = false* (default): Repository at ~<path>/~
+- *useWorkspace = true*: Repository at ~<path>/<rev>/~
+- *Important*: ~rev~ must be explicitly set when using workspace mode (cannot auto-detect, as path needs to be known at Nix evaluation time)
+- Enables sibling jj workspaces: ~jj workspace add ../other-branch~
+
+** Auto-Update
+
+- *update = false* (default): Only clone, never update
+- *update = true*: Run ~jj git fetch~ on every activation
+- Fetches from Git remote into jj repository
+- User manually advances bookmarks as needed (jj doesn't auto-merge)
+
+** Existence Check
+
+Check for ~.jj~ directory (not ~.git~):
+
+#+begin_src bash
+if [ ! -d "${repoPath}/.jj" ]; then
+  # Clone
+else
+  # Update or skip
+fi
+#+end_src
+
+This correctly identifies Jujutsu repositories even when not co-located.
+
+* Test Plan
+
+** Functional Tests
+
+1. *Basic jj clone (HTTPS)*:
+   - URL: https://github.com/martinvonz/jj.git
+   - Verify: .jj and .git directories exist
+   - Verify: Can run both ~jj status~ and ~git status~
+
+2. *Basic jj clone (SSH)*:
+   - URL: git@github.com:user/repo.git
+   - Verify: GPG agent socket used for auth
+   - Verify: Repository cloned successfully
+
+3. *Worktree mode*:
+   - useWorktree = true, rev = "main"
+   - Verify: Repository at ~~/Coding/repo/main/~ 
+   - Verify: Can create sibling workspaces
+
+4. *Colocated repository*:
+   - colocate = true (default)
+   - Verify: Both .jj and .git directories exist
+   - Verify: jj and git commands both work
+
+5. *Pure jj repository*:
+   - colocate = false
+   - Verify: Only .jj directory exists
+   - Verify: git commands fail
+
+6. *Auto-update mode*:
+   - update = true
+   - Verify: ~jj git fetch~ runs on subsequent activations
+   - Verify: New commits fetched from remote
+
+7. *Multiple jj repositories*:
+   - Configure 3+ repositories
+   - Verify: All clone successfully
+   - Verify: Independent activation scripts
+
+8. *Coexistence with home.gitClone*:
+   - Configure both ~home.gitClone~ and ~home.jjClone~ repos
+   - Verify: All repositories clone correctly
+   - Verify: Activation scripts don't conflict
+
+9. *Auto-detection of default branch*:
+   - Test with repos using "main", "master", "develop", etc.
+   - Verify: Correct branch detected and cloned
+   - Verify: Fallback to "main" when detection fails
+   - Test explicit rev override when auto-detection available
+
+** Integration Tests
+
+- Test with Home Manager dry-run mode (~--dry-run~)
+- Test activation script ordering (no conflicts with gitClone)
+- Test error handling (network failures, auth failures)
+- Test idempotency (re-running activation doesn't re-clone)
+
+* Infrastructure Needed
+
+** Required
+
+- Jujutsu (jj) installed via ~home.packages~ or nixpkgs
+- Git (required for ~jj git clone~ even with pure jj repos)
+- SSH/GPG agent for authentication (same as gitClone)
+
+** Configuration Example
+
+#+begin_src nix
+{
+  config, pkgs, ...
+}:
+{
+  home.packages = [ pkgs.jujutsu ];
+
+  home.jjClone = {
+    "Coding/jj-project" = {
+      url = "git@github.com:user/project.git";
+      rev = "main";
+    };
+  };
+}
+#+end_src
+
+* Drawbacks
+
+1. *Code duplication*: Similar logic to ~home.gitClone~, but necessary for extensibility
+2. *Two options for VCS*: Users might be confused about when to use which
+
+** Mitigation
+
+- Clear documentation explaining when to use each option
+
+* Alternatives
+
+** 1. Unified home.vcsClone with VCS parameter
+
+- *Pro*: Single interface for all VCS (git, jj, hg, fossil, etc.)
+- *Con*: Complex option schema, harder to type-check, less discoverable
+- *Rejected*: Too abstract, users prefer explicit options for clarity
+
+** 2. Make home.jjClone an alias to home.gitClone
+
+- *Pro*: No code duplication, just syntactic sugar
+- *Con*: Doesn't enable jj-specific features, same limitations as current approach
+- *Rejected*: Doesn't meet goal of supporting jj-specific options
+
+** Default Branch Auto-Detection
+
+When ~rev~ is not specified (null):
+- Module queries the remote repository for its default branch using ~git ls-remote --symref~
+- Works with any default branch name: main, master, develop, trunk, etc.
+- Falls back to "main" if detection fails
+- Detection happens at activation time (bash runtime), not Nix evaluation time
+- Adds one network call per repository on first clone
+- *Limitation*: Cannot be used with ~useWorkspace = true~ (rev must be explicit for path construction)
+
+This is particularly useful for Jujutsu repos since:
+- Many jj repositories are migrating from Git and may use "master" or other branches
+- Users don't need to check which branch is default before configuring
+- Future-proof as jj ecosystem evolves its conventions
+
+* Future Enhancements
+
+Once foundation is in place, future versions can add:
+
+** Bookmark Management
+
+#+begin_src nix
+home.jjClone."Coding/project" = {
+  url = "...";
+  bookmarks = [ "main" "develop" ];  # Track multiple bookmarks
+  defaultBookmark = "main";          # Default to this bookmark
+};
+#+end_src
+
+** Change-ID Handling
+
+#+begin_src nix
+home.jjClone."Coding/project" = {
+  url = "...";
+  abandonOld = true;  # Auto-abandon old changes after fetch
+};
+#+end_src
+
+** Workspace Management
+
+#+begin_src nix
+home.jjClone."Coding/project" = {
+  url = "...";
+  workspaces = {
+    "feature-a" = { bookmark = "feature-a"; };
+    "feature-b" = { bookmark = "feature-b"; };
+  };
+};
+#+end_src
+
+* History
+
+- 2026-01-05: Specification created, ready for implementation
+- 2026-01-08: Implementation complete with modular file structure
+
+* References
+
+- [[https://github.com/martinvonz/jj][Jujutsu VCS documentation]]
+- [[file:../initialise-home-git-clone.org][home.gitClone implementation]]
+- [[file:../../nix/default.nix][Module options (nix/default.nix)]]
+- [[file:../../nix/jj-clone.nix][Jujutsu script generator (nix/jj-clone.nix)]]
+- [[file:../../nix/helpers.nix][Shared helpers (nix/helpers.nix)]]
+- [[file:../../README.org][User documentation]]
