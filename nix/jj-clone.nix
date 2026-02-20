@@ -32,7 +32,7 @@ let
 in
 lib.nameValuePair "jjClone-${name}" (
   lib.hm.dag.entryAfter [ "writeBoundary" "reloadSystemd" ] ''
-    export PATH="${pkgs.jujutsu}/bin:${pkgs.git}/bin:${pkgs.openssh}/bin:${pkgs.coreutils}/bin:$PATH"
+    export PATH="${pkgs.jujutsu}/bin:${pkgs.git}/bin:${pkgs.openssh}/bin:${pkgs.gnupg}/bin:${pkgs.coreutils}/bin:$PATH"
 
     ${helpers.setupGpgAgent}
 
