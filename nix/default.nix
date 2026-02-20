@@ -71,6 +71,12 @@ let
         default = false;
         description = "Whether to pull updates on activation";
       };
+
+      updateFailMode = lib.mkOption {
+        type = lib.types.enum [ "error" "warn" ];
+        default = "error";
+        description = "Whether update failures cause an error or a warning";
+      };
     };
   };
 
@@ -127,6 +133,12 @@ let
         type = lib.types.bool;
         default = false;
         description = "Whether to fetch updates on activation (runs jj git fetch)";
+      };
+
+      updateFailMode = lib.mkOption {
+        type = lib.types.enum [ "error" "warn" ];
+        default = "error";
+        description = "Whether update failures cause an error or a warning";
       };
     };
   };

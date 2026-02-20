@@ -50,7 +50,11 @@ lib.nameValuePair "jjClone-${name}" (
     ${lib.optionalString repo.update ''
       else
         echo "Updating Jujutsu repository at $REPO_PATH..."
-        ${helpers.withRetry {} ''$DRY_RUN_CMD ${withBypass ''${pkgs.jujutsu}/bin/jj -R "$REPO_PATH" git fetch''}''}
+        ${helpers.withRetry { failMode = repo.updateFailMode; } ''
+          $DRY_RUN_CMD ${withBypass ''
+            ${pkgs.jujutsu}/bin/jj -R "$REPO_PATH" git fetch
+          ''}
+        ''}
     ''}
     fi
   ''

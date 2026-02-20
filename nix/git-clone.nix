@@ -49,7 +49,11 @@ lib.nameValuePair "gitClone-${name}" (
     ${lib.optionalString repo.update ''
       else
         echo "Updating repository at $REPO_PATH..."
-        ${helpers.withRetry {} ''$DRY_RUN_CMD ${withBypass ''${pkgs.git}/bin/git -C "$REPO_PATH" pull''}''}
+        ${helpers.withRetry { failMode = repo.updateFailMode; } ''
+          $DRY_RUN_CMD ${withBypass ''
+            ${pkgs.git}/bin/git -C "$REPO_PATH" pull
+          ''}
+        ''}
     ''}
     fi
   ''

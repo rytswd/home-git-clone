@@ -7,7 +7,7 @@
 {
   # Retry a command with exponential backoff for transient network failures
   # (e.g., DNS not yet available during nixos-rebuild switch)
-  withRetry = { retries ? 3, delay ? 2 }: cmd: ''
+  withRetry = { retries ? 3, delay ? 2, failMode ? "error" }: cmd: ''
     _retry_count=0
     _retry_max=${toString retries}
     _retry_delay=${toString delay}
@@ -17,8 +17,8 @@
       else
         _retry_count=$((_retry_count + 1))
         if [ "$_retry_count" -ge "$_retry_max" ]; then
-          echo "Command failed after $_retry_max attempts, skipping." >&2
-          break
+          echo "Command failed after $_retry_max attempts." >&2
+          ${if failMode == "warn" then "break" else "exit 1"}
         fi
         echo "Attempt $_retry_count/$_retry_max failed, retrying in ''${_retry_delay}s..." >&2
         sleep "$_retry_delay"
