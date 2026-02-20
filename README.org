@@ -160,13 +160,22 @@ home.gitClone = {
 #+html:<details>
 #+html:<summary><strong>Auto-Update</strong> — Pull latest on every activation</summary>
 
-Pull latest changes every time you run ~home-manager switch~.
+Pull latest changes every time you run ~home-manager switch~. Retries up to 3 times with exponential backoff for transient network failures (e.g., DNS not yet available during ~nixos-rebuild switch~).
+
+By default, a failed update is an error. Set ~updateFailMode = "warn"~ to log a warning and continue instead.
 
 #+begin_src nix
 home.gitClone = {
   "Coding/always-fresh" = {
     url = "git@github.com:user/repo.git";
     update = true;
+  };
+
+  # Non-critical repo: warn on failure instead of erroring
+  "Coding/nice-to-have" = {
+    url = "https://github.com/user/repo.git";
+    update = true;
+    updateFailMode = "warn";
   };
 };
 #+end_src
@@ -247,11 +256,14 @@ home.jjClone = {
 #+html:<details>
 #+html:<summary><strong>Auto-Update</strong> — Fetch latest on every activation</summary>
 
+Retries up to 3 times with exponential backoff. Set ~updateFailMode = "warn"~ to continue on failure instead of erroring.
+
 #+begin_src nix
 home.jjClone = {
   "Coding/jj-fresh" = {
     url = "git@github.com:user/repo.git";
     update = true;  # Runs: jj git fetch
+    updateFailMode = "warn";  # Optional: don't fail activation on fetch errors
   };
 };
 #+end_src
@@ -313,6 +325,7 @@ This is particularly useful for managing configuration files:
 | ~useWorktree~     | bool             | ~false~ | Append rev to path for worktree structure        |
 | ~bypassGitConfig~ | bool or null     | ~null~  | Override git config bypass (auto for HTTPS)      |
 | ~update~          | bool             | ~false~ | Pull on every activation                         |
+| ~updateFailMode~  | "error" or "warn" | ~"error"~ | Whether update failures cause an error or warning |
 
 *** home.jjClone.<path>
 
@@ -324,6 +337,7 @@ This is particularly useful for managing configuration files:
 | ~useWorkspace~    | bool             | ~false~ | Append rev to path for workspace structure       |
 | ~bypassGitConfig~ | bool or null     | ~null~  | Override git config bypass (auto for HTTPS)      |
 | ~update~          | bool             | ~false~ | Fetch on every activation (jj git fetch)         |
+| ~updateFailMode~  | "error" or "warn" | ~"error"~ | Whether update failures cause an error or warning |
 
 ** ⚙️ Advanced Usage
 
