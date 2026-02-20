@@ -5,6 +5,28 @@
 }:
 
 {
+  # Retry a command with exponential backoff for transient network failures
+  # (e.g., DNS not yet available during nixos-rebuild switch)
+  withRetry = { retries ? 3, delay ? 2 }: cmd: ''
+    _retry_count=0
+    _retry_max=${toString retries}
+    _retry_delay=${toString delay}
+    while true; do
+      if ${cmd}; then
+        break
+      else
+        _retry_count=$((_retry_count + 1))
+        if [ "$_retry_count" -ge "$_retry_max" ]; then
+          echo "Command failed after $_retry_max attempts, skipping." >&2
+          break
+        fi
+        echo "Attempt $_retry_count/$_retry_max failed, retrying in ''${_retry_delay}s..." >&2
+        sleep "$_retry_delay"
+        _retry_delay=$((_retry_delay * 2))
+      fi
+    done
+  '';
+
   # Auto-detect default branch from remote repository
   autoDetectBranch = url: bypassWrapper: ''
     echo "Auto-detecting default branch for ${url}..."
