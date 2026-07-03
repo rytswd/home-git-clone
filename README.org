@@ -36,6 +36,8 @@ Run ~home-manager switch~ and your repositories appear. *Define once, deploy eve
 ** ✨ Features
 
 - *Declarative* — Define repositories in Nix, clone automatically
+- *Remote Preflight* — Every remote verified before activation mutates anything, all failures reported at once
+- *Doctor App* — ~nix run github:rytswd/home-git-clone#check~ probes any machine's repositories ad hoc
 - *Auto Default Branch* — Detects "main" vs "master" automatically
 - *Git + Jujutsu* — Full support for both VCS systems
 - *Worktree Ready* — Optional path structure for easy worktree workflows
@@ -43,6 +45,7 @@ Run ~home-manager switch~ and your repositories appear. *Define once, deploy eve
 - *Auto-Update* — Optionally pull/fetch on every activation
 - *Multi-User Safe* — Each user's credentials, isolated operations
 - *GPG Agent* — Automatic SSH socket detection
+- *Systemd Mode* — Optional retrying clone execution outside activation (Linux)
 
 ** 🚀 Quick Start
 
@@ -296,6 +299,88 @@ jj workspace add ../develop
 
 #+html:</details>
 
+*** Preflight and Doctor
+
+#+html:<details>
+#+html:<summary><strong>Remote Preflight</strong> — Catch unreachable repositories before anything changes</summary>
+
+Before Home Manager writes anything, every configured remote (both ~home.gitClone~ and ~home.jjClone~) is probed with a short ~git ls-remote~ (10 second timeout per repository). All failures are aggregated into a single report — repository, URL, and a one-line cause each — and activation aborts before any mutation, so one missing SSH key no longer fails the generation midway with a raw git error.
+
+#+begin_example
+home-git-clone: remote preflight failed for 2 of 5 probed repositories:
+  - Coding/dotfiles (git)
+      url:   git@github.com:user/dotfiles.git
+      cause: git@github.com: Permission denied (publickey).
+  - Coding/notes (jj)
+      url:   git@github.com:user/notes.git
+      cause: timed out after 10s
+Aborting before any changes were made (home.cloneVerifyRemotes = "fail").
+#+end_example
+
+The probes also run during ~home-manager switch --dry-run~, turning a dry run into a real preflight for the target machine. Repositories already on disk are skipped unless they would pull/fetch fatally (~update = true~ with ~updateFailMode = "error"~), so a fully-cloned machine still activates while offline.
+
+The behaviour is controlled by a single module-level option:
+
+#+begin_src nix
+home.cloneVerifyRemotes = "fail";  # default; abort activation on unreachable remotes
+home.cloneVerifyRemotes = "warn";  # print the report but continue
+home.cloneVerifyRemotes = "off";   # no preflight
+#+end_src
+
+Use ~"warn"~ for bootstrap flows where credentials arrive only after the first activation (e.g. an SSH key placed by a secrets service once the user session exists): the first switch proceeds, and the repositories appear on a later one.
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>Repository Manifest</strong> — The configured repo set as JSON on the live system</summary>
+
+Whenever repositories are configured, the module renders them as JSON into the generation and links it at =~/.config/home-git-clone/manifest.json=:
+
+#+begin_src json
+{
+  "version": 1,
+  "repos": [
+    {
+      "name": "Coding/dotfiles",
+      "kind": "git",
+      "url": "git@github.com:user/dotfiles.git",
+      "path": "/home/user/Coding/dotfiles",
+      "bypassGitConfig": false
+    }
+  ]
+}
+#+end_src
+
+The manifest always describes the current generation, so tools (like the doctor app below) can inspect the live repository set without evaluating the Nix configuration that produced it.
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>Doctor App</strong> — Probe any machine's repositories ad hoc</summary>
+
+The ~check~ app reads a manifest, runs the same probes as the activation preflight, prints a table, and exits 0 when every remote is reachable (1 otherwise):
+
+#+begin_src bash
+nix run github:rytswd/home-git-clone#check                    # reads ~/.config/home-git-clone/manifest.json
+nix run github:rytswd/home-git-clone#check -- manifest.json   # explicit manifest file
+#+end_src
+
+#+begin_example
+REPO                    | URL                                  | STATUS
+----------------------------------------------------------------------
+Coding/dotfiles (git)   | git@github.com:user/dotfiles.git     | OK
+Coding/notes (jj)       | git@github.com:user/notes.git        | FAIL
+
+unreachable repositories:
+  - Coding/notes (jj)
+      url:   git@github.com:user/notes.git
+      cause: git@github.com: Permission denied (publickey).
+#+end_example
+
+This is handy at deploy time: before switching a target host, run the doctor on it (or copy its manifest and probe from anywhere) to confirm every repository will be cloneable — no Home Manager evaluation required on the probing machine.
+
+#+html:</details>
+
 *** Symlinking Files
 
 Since repositories are cloned directly to your home directory (outside the Nix store), you can symlink files or directories from them using ~config.lib.file.mkOutOfStoreSymlink~.
@@ -339,6 +424,15 @@ This is particularly useful for managing configuration files:
 | ~update~          | bool             | ~false~ | Fetch on every activation (jj git fetch)         |
 | ~updateFailMode~  | "error" or "warn" | ~"error"~ | Whether update failures cause an error or warning |
 
+*** Module Options
+
+These apply to all repositories (both ~home.gitClone~ and ~home.jjClone~):
+
+| Option                       | Type                      | Default  | Description                                            |
+|------------------------------+---------------------------+----------+--------------------------------------------------------|
+| ~home.cloneVerifyRemotes~    | "fail", "warn" or "off" | ~"fail"~ | Verify all remotes before activation mutates anything  |
+| ~home.cloneUseSystemdService~ | bool                      | ~false~  | Run clones in a retrying systemd user service (Linux)  |
+
 ** ⚙️ Advanced Usage
 
 #+html:<details>
@@ -361,6 +455,24 @@ home.gitClone = {
   };
 };
 #+end_src
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>Systemd Execution Mode</strong> — Retry transient clone failures outside activation</summary>
+
+By default, clones run inline during activation, so a transient network flake mid-transfer fails the generation. On Linux you can move the clone execution into a oneshot systemd user service instead:
+
+#+begin_src nix
+home.cloneUseSystemdService = true;
+#+end_src
+
+- Activation triggers ~home-git-clone.service~ (non-blocking) and finishes immediately; the service also runs at login as a fallback when the user bus is unreachable during activation.
+- The service retries on failure (~Restart=on-failure~, 30s apart, capped at 5 attempts per 10 minutes), so transient flakes recover without failing generations. Idempotency means retries skip already-cloned repositories.
+- The remote preflight (~home.cloneVerifyRemotes~) still runs during activation, so genuinely unreachable remotes remain loud and early.
+- Clone output moves from the activation transcript to the journal: ~journalctl --user -u home-git-clone~.
+
+Requires systemd ≥ 244. On other platforms the option is ignored with a warning and clones run inline, so a shared configuration stays portable.
 
 #+html:</details>
 
@@ -440,6 +552,13 @@ Use both module types in the same configuration:
                   │
                   ▼
   ┌─────────────────────────────────┐
+  │  Preflight: probe all remotes,  │
+  │  aggregate failures, abort      │
+  │  before any mutation            │
+  └───────────────┬─────────────────┘
+                  │
+                  ▼
+  ┌─────────────────────────────────┐
   │  For each repository:           │
   │  1. Check if already cloned     │
   │  2. Auto-detect default branch  │
@@ -459,6 +578,7 @@ Use both module types in the same configuration:
 | Behavior        | Description                                              |
 |-----------------+----------------------------------------------------------|
 | *Idempotent*    | Safe to run repeatedly — existing repos left untouched   |
+| *Preflight*     | Remotes verified before any mutation; dry runs probe too |
 | *SSH Detection* | Auto-uses GPG agent socket at =~/.gnupg/S.gpg-agent.ssh= |
 | *HTTPS Bypass*  | Prevents =url.*.insteadOf= rewrites for HTTPS URLs       |
 | *Update Mode*   | Only fetches/pulls when =update = true=                  |
@@ -473,7 +593,7 @@ Removing a repository from your configuration *does not* delete the directory fr
 If the target directory already contains a Git repository, the module *assumes it is correct*. It does not validate that the local repository's remote URL matches the one specified in your configuration. This ensures that manually modified remotes (e.g., using different push URLs) are not overwritten or flagged as errors.
 
 *** Sequential Activation
-Cloning happens during the activation phase of Home Manager. If you are cloning many large repositories for the first time, ~home-manager switch~ will wait for all clones to complete before finishing.
+Cloning happens during the activation phase of Home Manager. If you are cloning many large repositories for the first time, ~home-manager switch~ will wait for all clones to complete before finishing. On Linux, ~home.cloneUseSystemdService~ moves the clone execution into a background systemd user service instead.
 
 ** 🔍 Troubleshooting
 
@@ -489,6 +609,23 @@ Cloning happens during the activation phase of Home Manager. If you are cloning 
 #+begin_src bash
    rm -rf ~/path/to/repo
    home-manager switch
+#+end_src
+
+#+html:</details>
+
+#+html:<details>
+#+html:<summary><strong>Preflight Blocks Activation</strong></summary>
+
+The preflight failing means the listed repositories would not be cloneable — the report shows each repository, URL, and cause. If you want to switch anyway (e.g. the credentials arrive after this activation):
+
+#+begin_src nix
+home.cloneVerifyRemotes = "warn";  # report but continue
+#+end_src
+
+To diagnose without activating, run the doctor app:
+
+#+begin_src bash
+nix run github:rytswd/home-git-clone#check
 #+end_src
 
 #+html:</details>
