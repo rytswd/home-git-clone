@@ -16,6 +16,36 @@
 
       formatter = forAllSystems (pkgs: pkgs.nixpkgs-fmt);
 
+      packages = forAllSystems (pkgs: {
+        # Doctor app: probes every repository in a manifest written by the
+        # module (~/.config/home-git-clone/manifest.json by default), so any
+        # machine -- including a deploy target before switching -- can be
+        # checked ad hoc with `nix run github:rytswd/home-git-clone#check`.
+        check = pkgs.writeShellApplication {
+          name = "home-git-clone-check";
+          runtimeInputs = with pkgs; [
+            coreutils
+            git
+            jq
+            openssh
+          ];
+          text = builtins.readFile ./nix/check.sh;
+        };
+      });
+
+      apps = forAllSystems (pkgs: {
+        check = {
+          type = "app";
+          program = "${self.packages.${pkgs.system}.check}/bin/home-git-clone-check";
+          meta.description = "Probe every repository in a home-git-clone manifest";
+        };
+      });
+
+      checks = forAllSystems (pkgs: {
+        # Building the doctor app runs its shellcheck gate.
+        check = self.packages.${pkgs.system}.check;
+      });
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           name = "home-git-clone";

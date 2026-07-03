@@ -12,6 +12,7 @@ let
 
   helpers = import ./helpers.nix { inherit lib config pkgs; };
   preflightEntry = import ./preflight.nix { inherit lib pkgs helpers; };
+  manifestFile = import ./manifest.nix { inherit lib pkgs helpers; };
   gitCloneRepoScript = import ./git-clone.nix {
     inherit
       lib
@@ -295,6 +296,15 @@ in
         gitRepos = gitCfg;
         jjRepos = jjCfg;
         mode = config.home.cloneVerifyRemotes;
+      };
+    })
+    (lib.mkIf anyRepos {
+      # Always rendered when repositories are configured: inert data, and
+      # the doctor app (`nix run github:rytswd/home-git-clone#check`)
+      # depends on it being present on the live system.
+      home.file.".config/home-git-clone/manifest.json".source = manifestFile {
+        gitRepos = gitCfg;
+        jjRepos = jjCfg;
       };
     })
   ];
