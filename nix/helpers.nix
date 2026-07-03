@@ -39,6 +39,22 @@
     echo "Detected default branch: $DEFAULT_BRANCH"
   '';
 
+  # Effective target path, git-config bypass and VCS marker directory for a
+  # configured repository. Shared by the clone scripts, the preflight and the
+  # manifest so their views of a repository cannot drift apart.
+  repoFacts = kind: path: repo:
+    let
+      useSubdir = if kind == "git" then repo.useWorktree else repo.useWorkspace;
+      finalPath = if useSubdir then "${path}/${repo.rev}" else path;
+    in
+    {
+      repoPath = "${config.home.homeDirectory}/${finalPath}";
+      # Auto-bypass git config for HTTPS URLs to prevent SSH rewrites
+      shouldBypass =
+        if repo.bypassGitConfig != null then repo.bypassGitConfig else lib.hasPrefix "https://" repo.url;
+      vcsDir = if kind == "git" then ".git" else ".jj";
+    };
+
   # Setup GPG agent SSH socket if available
   setupGpgAgent = ''
     if [ -S "${config.home.homeDirectory}/.gnupg/S.gpg-agent.ssh" ]; then

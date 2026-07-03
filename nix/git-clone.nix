@@ -9,16 +9,12 @@ path: repo:
 let
   name = builtins.replaceStrings [ "/" ] [ "-" ] path;
 
-  finalPath = if repo.useWorktree then "${path}/${repo.rev}" else path;
-  repoPath = "${config.home.homeDirectory}/${finalPath}";
-
-  # Auto-bypass git config for HTTPS URLs to prevent SSH rewrites
-  isHttps = lib.hasPrefix "https://" repo.url;
-  shouldBypass = if repo.bypassGitConfig != null then repo.bypassGitConfig else isHttps;
+  facts = helpers.repoFacts "git" path repo;
+  repoPath = facts.repoPath;
 
   withBypass =
     cmd:
-    if shouldBypass then
+    if facts.shouldBypass then
       ''${pkgs.coreutils}/bin/env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null ${cmd}''
     else
       cmd;

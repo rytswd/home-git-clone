@@ -9,16 +9,13 @@ path: repo:
 let
   name = builtins.replaceStrings [ "/" ] [ "-" ] path;
 
-  finalPath = if repo.useWorkspace then "${path}/${repo.rev}" else path;
-  repoPath = "${config.home.homeDirectory}/${finalPath}";
-
-  # Jujutsu uses git under the hood, auto-bypass for HTTPS URLs
-  isHttps = lib.hasPrefix "https://" repo.url;
-  shouldBypass = if repo.bypassGitConfig != null then repo.bypassGitConfig else isHttps;
+  # Jujutsu uses git under the hood, so the same bypass logic applies
+  facts = helpers.repoFacts "jj" path repo;
+  repoPath = facts.repoPath;
 
   withBypass =
     cmd:
-    if shouldBypass then
+    if facts.shouldBypass then
       ''${pkgs.coreutils}/bin/env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null ${cmd}''
     else
       cmd;

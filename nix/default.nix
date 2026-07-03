@@ -8,8 +8,10 @@
 let
   gitCfg = config.home.gitClone;
   jjCfg = config.home.jjClone;
+  anyRepos = gitCfg != { } || jjCfg != { };
 
   helpers = import ./helpers.nix { inherit lib config pkgs; };
+  preflightEntry = import ./preflight.nix { inherit lib pkgs helpers; };
   gitCloneRepoScript = import ./git-clone.nix {
     inherit
       lib
@@ -195,6 +197,31 @@ in
     '';
   };
 
+  options.home.cloneVerifyRemotes = lib.mkOption {
+    type = lib.types.enum [
+      "fail"
+      "warn"
+      "off"
+    ];
+    default = "fail";
+    description = ''
+      Whether to verify that every configured remote (home.gitClone and
+      home.jjClone) is reachable before activation mutates anything.
+
+      Probes run before Home Manager's writeBoundary and aggregate all
+      failures into a single report, so one unreachable remote no longer
+      fails the generation midway with a raw git error. Probes also run
+      during `home-manager switch --dry-run`, turning dry runs into real
+      preflights for the target machine.
+
+      "fail" (default) aborts activation when any remote is unreachable.
+      "warn" prints the same report but continues; useful for bootstrap
+      flows where credentials arrive after the first activation (e.g. an
+      SSH key placed by a secrets service once the user session exists).
+      "off" disables the preflight entirely.
+    '';
+  };
+
   options.home.jjClone = lib.mkOption {
     type = lib.types.attrsOf (lib.types.submodule jjRepoModule);
     default = { };
@@ -262,6 +289,13 @@ in
         assertion = repo.useWorkspace -> repo.rev != null;
         message = "home.jjClone.\"${name}\": useWorkspace requires rev to be explicitly set (cannot auto-detect in workspace mode)";
       }) jjCfg;
+    })
+    (lib.mkIf (anyRepos && config.home.cloneVerifyRemotes != "off") {
+      home.activation.cloneVerifyRemotes = preflightEntry {
+        gitRepos = gitCfg;
+        jjRepos = jjCfg;
+        mode = config.home.cloneVerifyRemotes;
+      };
     })
   ];
 }
