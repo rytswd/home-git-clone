@@ -1,21 +1,27 @@
 # Probe every repository recorded in a home-git-clone manifest and report
 # reachability, without needing the Nix configuration that produced it.
+# Unlike the activation preflight, this probes every configured repository,
+# whether or not it is already cloned locally -- the question answered here
+# is "could this manifest be provisioned from scratch on this machine?".
 #
 # Usage: home-git-clone-check [MANIFEST]
-#   MANIFEST defaults to ~/.config/home-git-clone/manifest.json (the live
-#   symlink maintained by the Home Manager module).
+#   MANIFEST defaults to $XDG_CONFIG_HOME/home-git-clone/manifest.json (the
+#   live symlink maintained by the Home Manager module).
 #
 # Exit codes: 0 when all remotes are reachable, 1 otherwise.
+#
+# The hgc_probe_url function is prepended from nix/probe.sh at build time,
+# keeping the probe behaviour identical to the activation preflight.
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
   echo "Usage: home-git-clone-check [MANIFEST]"
   echo "Probe every repository in a home-git-clone manifest and report reachability."
-  echo "MANIFEST defaults to \$HOME/.config/home-git-clone/manifest.json."
+  echo "MANIFEST defaults to \$XDG_CONFIG_HOME/home-git-clone/manifest.json."
   echo "Exit codes: 0 all remotes reachable, 1 otherwise."
   exit 0
 fi
 
-manifest="${1:-$HOME/.config/home-git-clone/manifest.json}"
+manifest="${1:-${XDG_CONFIG_HOME:-$HOME/.config}/home-git-clone/manifest.json}"
 
 if [ ! -r "$manifest" ]; then
   echo "error: cannot read manifest: $manifest" >&2
@@ -29,8 +35,8 @@ if [ "$version" != "1" ]; then
   exit 1
 fi
 
-# Mirror the module's SSH setup so the verdict here predicts what an
-# activation on this machine would see.
+# Mirror the module's SSH setup so probes authenticate the same way the
+# clones would on this machine.
 if [ -S "$HOME/.gnupg/S.gpg-agent.ssh" ]; then
   export SSH_AUTH_SOCK="$HOME/.gnupg/S.gpg-agent.ssh"
 fi
@@ -39,12 +45,20 @@ names=()
 kinds=()
 urls=()
 bypasses=()
-while IFS=$'\t' read -r name kind url bypass _path; do
+refs=()
+# Bypass and ref are resolved inside jq, straight into the probe's own
+# vocabulary, so no field is ever empty: bash collapses adjacent tabs for
+# whitespace IFS, which would shift the remaining columns. A null/absent
+# rev (auto-detected default branch, or an older version-1 manifest without
+# the field) degrades to probing HEAD, exactly like the clone's own
+# detection.
+while IFS=$'\t' read -r name kind url bypass ref _path; do
   names+=("$name")
   kinds+=("$kind")
   urls+=("$url")
   bypasses+=("$bypass")
-done < <(jq -r '.repos[] | [.name, .kind, .url, (.bypassGitConfig | tostring), .path] | @tsv' "$manifest")
+  refs+=("$ref")
+done < <(jq -r '.repos[] | [.name, .kind, .url, (if .bypassGitConfig then "1" else "0" end), (if (.rev // "") == "" then "HEAD" else "refs/heads/" + .rev end), .path] | @tsv' "$manifest")
 
 if [ "${#names[@]}" -eq 0 ]; then
   echo "manifest contains no repositories: $manifest"
@@ -71,29 +85,14 @@ statuses=()
 causes=()
 overall=0
 for i in "${!names[@]}"; do
-  # Same probe as the module's activation preflight: GIT_TERMINAL_PROMPT=0
-  # makes credential prompts fail fast instead of hanging under the timeout,
-  # and bypassGitConfig reproduces the environment the clone would use.
-  probe_env=(GIT_TERMINAL_PROMPT=0)
-  if [ "${bypasses[$i]}" = "true" ]; then
-    probe_env+=(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null)
-  fi
-  rc=0
-  err="$(env "${probe_env[@]}" timeout 10 git ls-remote --exit-code "${urls[$i]}" HEAD 2>&1 >/dev/null)" || rc=$?
-  if [ "$rc" -eq 0 ]; then
+  hgc_probe_url "${urls[$i]}" "${bypasses[$i]}" "${refs[$i]}"
+  if [ "$hgc_probe_rc" -eq 0 ]; then
     statuses+=("OK")
     causes+=("")
   else
     overall=1
     statuses+=("FAIL")
-    if [ "$rc" -eq 124 ]; then
-      causes+=("timed out after 10s")
-    else
-      # First non-empty stderr line: the root cause (ssh/curl error) comes
-      # first, git's generic advice last.
-      cause="$(printf '%s\n' "$err" | grep -v '^[[:space:]]*$' | head -n 1 || true)"
-      causes+=("${cause:-probe failed with exit code $rc}")
-    fi
+    causes+=("$hgc_probe_cause")
   fi
 done
 

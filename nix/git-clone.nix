@@ -21,9 +21,9 @@ let
 
   cloneArgs =
     if repo.rev != null then
-      ''--branch "${repo.rev}" "${repo.url}" "$REPO_PATH"''
+      ''--branch "${repo.rev}" "${repo.url}" "$HGC_PARTIAL"''
     else
-      ''--branch "$DEFAULT_BRANCH" "${repo.url}" "$REPO_PATH"'';
+      ''--branch "$DEFAULT_BRANCH" "${repo.url}" "$HGC_PARTIAL"'';
 in
 lib.nameValuePair "gitClone-${name}" (
   lib.hm.dag.entryAfter [ "writeBoundary" "reloadSystemd" ] ''
@@ -38,10 +38,12 @@ lib.nameValuePair "gitClone-${name}" (
 
       ${lib.optionalString (repo.rev == null) (helpers.autoDetectBranch repo.url withBypass)}
 
-      echo "Cloning ${repo.url} (${
-        if repo.rev != null then repo.rev else "$DEFAULT_BRANCH"
-      }) to $REPO_PATH..."
-      $DRY_RUN_CMD ${withBypass ''${pkgs.git}/bin/git clone ${cloneArgs}''}
+      ${helpers.atomicClone ''
+        echo "Cloning ${repo.url} (${
+          if repo.rev != null then repo.rev else "$DEFAULT_BRANCH"
+        }) to $REPO_PATH..."
+        $DRY_RUN_CMD ${withBypass ''${pkgs.git}/bin/git clone ${cloneArgs}''}
+      ''}
     ${lib.optionalString repo.update ''
       else
         echo "Updating repository at $REPO_PATH..."

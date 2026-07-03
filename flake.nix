@@ -28,22 +28,25 @@
             git
             jq
             openssh
+            ripgrep
           ];
-          text = builtins.readFile ./nix/check.sh;
+          # probe.sh first: it defines the hgc_probe_url function shared
+          # verbatim with the activation preflight.
+          text = builtins.readFile ./nix/probe.sh + builtins.readFile ./nix/check.sh;
         };
       });
 
       apps = forAllSystems (pkgs: {
         check = {
           type = "app";
-          program = "${self.packages.${pkgs.system}.check}/bin/home-git-clone-check";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.check}/bin/home-git-clone-check";
           meta.description = "Probe every repository in a home-git-clone manifest";
         };
       });
 
       checks = forAllSystems (pkgs: {
         # Building the doctor app runs its shellcheck gate.
-        check = self.packages.${pkgs.system}.check;
+        check = self.packages.${pkgs.stdenv.hostPlatform.system}.check;
       });
 
       devShells = forAllSystems (pkgs: {

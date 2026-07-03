@@ -35,8 +35,9 @@ in
       ExecStart = "${cloneScript}";
       # Valid for oneshot units since systemd 244; oneshot units are never
       # restarted on clean exit. set -eu stops the script at the first
-      # failure, and the idempotent existence checks make whole-set retries
-      # converge instead of re-cloning.
+      # failure, and retries converge: completed repositories are skipped by
+      # the existence check, while interrupted clones never reach their
+      # final path (temp-dir + rename) so they are simply redone.
       Restart = "on-failure";
       RestartSec = 30;
     };
@@ -51,8 +52,23 @@ in
     lib.hm.dag.entryAfter [ "reloadSystemd" ] ''
       # Unlike the preflight, the trigger is gated on dry-run: starting the
       # service would perform real clones.
-      if ! $DRY_RUN_CMD ${pkgs.systemd}/bin/systemctl --user restart --no-block home-git-clone.service; then
-        echo "Warning: systemd user instance unreachable; home-git-clone.service will run at next login instead." >&2
+      #
+      # reset-failed first: after the start rate limiter trips, the unit
+      # refuses further starts (including this one) for the rest of the
+      # StartLimitIntervalSec window even once the underlying problem is
+      # fixed. Errors are ignored: the unit may simply never have failed,
+      # and an unreachable bus is diagnosed by the start below.
+      $DRY_RUN_CMD ${pkgs.systemd}/bin/systemctl --user reset-failed home-git-clone.service 2>/dev/null || true
+      # start, not restart: restart SIGTERMs an in-flight provisioning run
+      # (e.g. the login-triggered instance mid-clone), while start joins it;
+      # a completed oneshot without RemainAfterExit is inactive again, so
+      # start still re-runs the service on later activations.
+      if ! $DRY_RUN_CMD ${pkgs.systemd}/bin/systemctl --user start --no-block home-git-clone.service; then
+        if ${pkgs.systemd}/bin/systemctl --user is-enabled home-git-clone.service >/dev/null 2>&1; then
+          echo "Warning: could not start home-git-clone.service; inspect it with 'systemctl --user status home-git-clone'." >&2
+        else
+          echo "Warning: systemd user instance unreachable; home-git-clone.service will run when the user manager next starts." >&2
+        fi
       fi
     ''
   );

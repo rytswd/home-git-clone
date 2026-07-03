@@ -39,6 +39,21 @@
     echo "Detected default branch: $DEFAULT_BRANCH"
   '';
 
+  # Run a clone command against a module-owned sibling dir ($HGC_PARTIAL)
+  # and rename into place on success: a clone killed mid-transfer
+  # (SIGTERM/SIGKILL, e.g. systemd stop or logout) must never leave a torn
+  # repository that the existence check would treat as complete forever --
+  # jj in particular does not clean up its destination. The rename is
+  # atomic on the same filesystem, and a stale partial dir from a killed
+  # run is safe to remove because only this module writes there. Expects
+  # $REPO_PATH to be set; cloneCmd must clone into "$HGC_PARTIAL".
+  atomicClone = cloneCmd: ''
+    HGC_PARTIAL="$REPO_PATH.hgc-partial"
+    $DRY_RUN_CMD ${pkgs.coreutils}/bin/rm -rf "$HGC_PARTIAL"
+    ${cloneCmd}
+    $DRY_RUN_CMD ${pkgs.coreutils}/bin/mv "$HGC_PARTIAL" "$REPO_PATH"
+  '';
+
   # Effective target path, git-config bypass and VCS marker directory for a
   # configured repository. Shared by the clone scripts, the preflight and the
   # manifest so their views of a repository cannot drift apart.

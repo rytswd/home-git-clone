@@ -23,9 +23,9 @@ let
   colocateFlag = if repo.colocate then "--colocate" else "";
   cloneArgs =
     if repo.rev != null then
-      ''--branch "${repo.rev}" "${repo.url}" "$REPO_PATH"''
+      ''--branch "${repo.rev}" "${repo.url}" "$HGC_PARTIAL"''
     else
-      ''--branch "$DEFAULT_BRANCH" "${repo.url}" "$REPO_PATH"'';
+      ''--branch "$DEFAULT_BRANCH" "${repo.url}" "$HGC_PARTIAL"'';
 in
 lib.nameValuePair "jjClone-${name}" (
   lib.hm.dag.entryAfter [ "writeBoundary" "reloadSystemd" ] ''
@@ -40,10 +40,12 @@ lib.nameValuePair "jjClone-${name}" (
 
       ${lib.optionalString (repo.rev == null) (helpers.autoDetectBranch repo.url withBypass)}
 
-      echo "Cloning Jujutsu repository ${repo.url} (${
-        if repo.rev != null then repo.rev else "$DEFAULT_BRANCH"
-      }) to $REPO_PATH..."
-      $DRY_RUN_CMD ${withBypass ''${pkgs.jujutsu}/bin/jj git clone ${colocateFlag} ${cloneArgs}''}
+      ${helpers.atomicClone ''
+        echo "Cloning Jujutsu repository ${repo.url} (${
+          if repo.rev != null then repo.rev else "$DEFAULT_BRANCH"
+        }) to $REPO_PATH..."
+        $DRY_RUN_CMD ${withBypass ''${pkgs.jujutsu}/bin/jj git clone ${colocateFlag} ${cloneArgs}''}
+      ''}
     ${lib.optionalString repo.update ''
       else
         echo "Updating Jujutsu repository at $REPO_PATH..."

@@ -317,7 +317,7 @@ home-git-clone: remote preflight failed for 2 of 5 probed repositories:
 Aborting before any changes were made (home.cloneVerifyRemotes = "fail").
 #+end_example
 
-The probes also run during ~home-manager switch --dry-run~, turning a dry run into a real preflight for the target machine. Repositories already on disk are skipped unless they would pull/fetch fatally (~update = true~ with ~updateFailMode = "error"~), so a fully-cloned machine still activates while offline.
+The probes also run during ~home-manager switch --dry-run~, turning a dry run into a real preflight for the target machine. Repositories already on disk are skipped unless they would pull/fetch fatally (~update = true~ with ~updateFailMode = "error"~), so a fully-cloned machine still activates while offline. When a repository pins a ~rev~, the probe asks the remote for that branch specifically, so a typo'd or upstream-deleted branch is also caught before anything changes.
 
 The behaviour is controlled by a single module-level option:
 
@@ -334,7 +334,7 @@ Use ~"warn"~ for bootstrap flows where credentials arrive only after the first a
 #+html:<details>
 #+html:<summary><strong>Repository Manifest</strong> — The configured repo set as JSON on the live system</summary>
 
-Whenever repositories are configured, the module renders them as JSON into the generation and links it at =~/.config/home-git-clone/manifest.json=:
+Whenever repositories are configured, the module renders them as JSON into the generation and links it at =~/.config/home-git-clone/manifest.json= (respecting ~xdg.configHome~):
 
 #+begin_src json
 {
@@ -345,6 +345,9 @@ Whenever repositories are configured, the module renders them as JSON into the g
       "kind": "git",
       "url": "git@github.com:user/dotfiles.git",
       "path": "/home/user/Coding/dotfiles",
+      "rev": null,
+      "update": false,
+      "updateFailMode": "error",
       "bypassGitConfig": false
     }
   ]
@@ -378,6 +381,8 @@ unreachable repositories:
 #+end_example
 
 This is handy at deploy time: before switching a target host, run the doctor on it (or copy its manifest and probe from anywhere) to confirm every repository will be cloneable — no Home Manager evaluation required on the probing machine.
+
+Note one deliberate difference from the activation preflight: the doctor probes *every* configured repository, whether or not it is already cloned locally — it answers "could this manifest be provisioned from scratch?". A fully-cloned machine that is offline can therefore activate fine while the doctor reports failures.
 
 #+html:</details>
 
@@ -469,6 +474,7 @@ home.cloneUseSystemdService = true;
 
 - Activation triggers ~home-git-clone.service~ (non-blocking) and finishes immediately; the service also runs at login as a fallback when the user bus is unreachable during activation.
 - The service retries on failure (~Restart=on-failure~, 30s apart, capped at 5 attempts per 10 minutes), so transient flakes recover without failing generations. Idempotency means retries skip already-cloned repositories.
+- Interrupted clones are safe: repositories are cloned into a temporary sibling directory and renamed into place only on completion, so a run killed mid-clone (logout without lingering, ~SIGKILL~ after ~TimeoutStopSec~) is simply redone on the next trigger instead of leaving a torn repository behind.
 - The remote preflight (~home.cloneVerifyRemotes~) still runs during activation, so genuinely unreachable remotes remain loud and early.
 - Clone output moves from the activation transcript to the journal: ~journalctl --user -u home-git-clone~.
 
@@ -591,6 +597,9 @@ Removing a repository from your configuration *does not* delete the directory fr
 
 *** No URL Validation on Existing Repos
 If the target directory already contains a Git repository, the module *assumes it is correct*. It does not validate that the local repository's remote URL matches the one specified in your configuration. This ensures that manually modified remotes (e.g., using different push URLs) are not overwritten or flagged as errors.
+
+*** Empty Remotes Are Rejected
+A repository that was created but never pushed (no branches yet) fails both the preflight and the clone itself, because the module always clones with ~--branch~. Declaring a just-created repository so it fills in later is unsupported until its first push — use ~cloneVerifyRemotes = "warn"~ if you need to activate before that.
 
 *** Sequential Activation
 Cloning happens during the activation phase of Home Manager. If you are cloning many large repositories for the first time, ~home-manager switch~ will wait for all clones to complete before finishing. On Linux, ~home.cloneUseSystemdService~ moves the clone execution into a background systemd user service instead.

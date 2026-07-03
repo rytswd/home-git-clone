@@ -336,8 +336,10 @@ in
     (lib.mkIf anyRepos {
       # Always rendered when repositories are configured: inert data, and
       # the doctor app (`nix run github:rytswd/home-git-clone#check`)
-      # depends on it being present on the live system.
-      home.file.".config/home-git-clone/manifest.json".source = manifestFile {
+      # depends on it being present on the live system. xdg.configFile (not
+      # home.file with a hardcoded .config) so xdg.configHome overrides are
+      # respected; the doctor resolves XDG_CONFIG_HOME the same way.
+      xdg.configFile."home-git-clone/manifest.json".source = manifestFile {
         gitRepos = gitCfg;
         jjRepos = jjCfg;
       };

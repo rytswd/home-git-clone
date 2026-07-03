@@ -73,8 +73,8 @@ A single activation entry, ~cloneVerifyRemotes~, registered via ~lib.hm.dag.entr
    - Target missing (no ~.git~ / ~.jj~ directory) → clone will run → probe.
    - Target present and ~update = true~ with ~updateFailMode = "error"~ → pull/fetch failure would fail activation → probe.
    - Target present otherwise → no fatal network operation → skip. This keeps a fully-cloned machine activatable while offline.
-3. Probes with ~timeout 10 git ls-remote --exit-code "<url>" HEAD~, under ~GIT_TERMINAL_PROMPT=0~ (a credential prompt must fail fast, not sit under the timeout) and the same per-repository git-config bypass the clone would use.
-4. Collects every failure (repo name, kind, url, one-line cause taken from the probe's last stderr line, or "timed out after 10s" on exit 124).
+3. Probes with ~timeout 10 git ls-remote --exit-code "<url>" <ref>~, where ~<ref>~ is ~refs/heads/<rev>~ for pinned repositories (a typo'd or upstream-deleted branch must fail the preflight, not the clone after ~writeBoundary~) and ~HEAD~ otherwise, under ~GIT_TERMINAL_PROMPT=0~ (a credential prompt must fail fast, not sit under the timeout) and the same per-repository git-config bypass the clone would use. The probe function itself lives in ~nix/probe.sh~, shared verbatim with the doctor app so the two implementations cannot drift.
+4. Collects every failure (repo name, kind, url, one-line cause taken from the probe's stderr; exit 124 reports a timeout with a hint about interactive prompts, and exit 2 -- reachable remote, missing ref, empty stderr -- gets a synthesised cause).
 5. If anything failed: prints the aggregated report to stderr, then exits 1 (~"fail"~) or continues with a notice (~"warn"~).
 
 The probe commands are intentionally *not* prefixed with ~$DRY_RUN_CMD~: probes mutate nothing, and running them during ~--dry-run~ is the feature — a dry run becomes a real preflight for the target machine.
@@ -82,7 +82,7 @@ The probe commands are intentionally *not* prefixed with ~$DRY_RUN_CMD~: probes 
 Report shape (one block per failure, aggregated):
 
 #+begin_example
-home-git-clone: remote preflight failed for 2 of 5 repositories:
+home-git-clone: remote preflight failed for 2 of 5 probed repositories:
   - Coding/dotfiles (git)
       url:   git@github.com:user/dotfiles.git
       cause: git@github.com: Permission denied (publickey).
@@ -94,7 +94,7 @@ Aborting before any changes were made (home.cloneVerifyRemotes = "fail").
 
 ** Manifest
 
-A new ~nix/manifest.nix~ renders the full configured repository set to JSON via ~pkgs.writeText~, linked through ~home.file~ at ~~/.config/home-git-clone/manifest.json~ so the live symlink always describes the current generation:
+A new ~nix/manifest.nix~ renders the full configured repository set to JSON via ~pkgs.writeText~, linked through ~xdg.configFile~ at ~~/.config/home-git-clone/manifest.json~ (respecting ~xdg.configHome~; the doctor resolves ~XDG_CONFIG_HOME~ the same way) so the live symlink always describes the current generation:
 
 #+begin_src json
 {
@@ -105,6 +105,9 @@ A new ~nix/manifest.nix~ renders the full configured repository set to JSON via 
       "kind": "git",
       "url": "git@github.com:user/dotfiles.git",
       "path": "/home/user/Coding/dotfiles",
+      "rev": null,
+      "update": false,
+      "updateFailMode": "error",
       "bypassGitConfig": false
     }
   ]
@@ -112,6 +115,7 @@ A new ~nix/manifest.nix~ renders the full configured repository set to JSON via 
 #+end_src
 
 - ~name~ is the attribute path as configured; ~kind~ is ~"git"~ or ~"jj"~; ~path~ is the absolute target (worktree/workspace expansion applied).
+- ~rev~ (null when the default branch is auto-detected) lets the doctor probe pinned branches like the preflight does; ~update~/~updateFailMode~ let consumers model which repositories an activation would actually touch.
 - ~bypassGitConfig~ is the *effective* boolean (explicit setting, or HTTPS auto-detection), so the doctor app can reproduce the clone environment without re-implementing the detection.
 - ~version~ allows the doctor app to reject manifests from incompatible future schemas.
 - Nix attribute iteration is name-sorted, so the manifest is deterministic.
@@ -125,7 +129,7 @@ nix run github:rytswd/home-git-clone#check              # reads ~/.config/home-g
 nix run github:rytswd/home-git-clone#check -- FILE.json # explicit manifest (e.g., copied from a target host)
 #+end_src
 
-Behaviour: parse the manifest with jq, run the same ~timeout 10 git ls-remote --exit-code <url> HEAD~ probe per repository (honouring ~bypassGitConfig~), print a table ~repo | url | status~ with per-failure causes below it, exit 0 if all reachable, 1 otherwise (including unreadable/unsupported manifest). Deploy-time use: fetch the target host's manifest (or evaluate it locally) and run the doctor *before* switching the host, from any machine with Nix.
+Behaviour: parse the manifest with jq, run the shared ~hgc_probe_url~ probe per repository (honouring ~bypassGitConfig~ and probing ~refs/heads/<rev>~ when a rev is recorded), print a table ~repo | url | status~ with per-failure causes below it, exit 0 if all reachable, 1 otherwise (including unreadable/unsupported manifest). Deploy-time use: fetch the target host's manifest (or evaluate it locally) and run the doctor *before* switching the host, from any machine with Nix. Unlike the preflight, the doctor probes every configured repository regardless of local state -- it answers "could this manifest be provisioned from scratch?", so a fully-cloned offline machine can activate fine while the doctor reports failures.
 
 ** Systemd Execution Mode
 
@@ -133,9 +137,9 @@ When ~home.cloneUseSystemdService = true~ on Linux:
 
 - The per-repository activation entries are *not* generated. Instead the same generated per-repo scripts (with ~DRY_RUN_CMD~ empty — a systemd unit has no dry-run concept) are concatenated into a single script run by a oneshot user service, ~home-git-clone.service~.
 - Unit shape: ~Type=oneshot~, ~Restart=on-failure~, ~RestartSec=30~, capped by ~StartLimitIntervalSec=600~ / ~StartLimitBurst=5~ (5 attempts in 10 minutes, then systemd gives up until the next trigger). ~Restart=on-failure~ is valid for oneshot units on systemd ≥ 244; oneshot units are never restarted on clean exit.
-- A single activation entry (~cloneSystemdService~, ~entryAfter ["reloadSystemd"]~ so the freshly written unit is loaded) triggers ~systemctl --user restart --no-block home-git-clone.service~. The trigger *is* gated on ~$DRY_RUN_CMD~ — dry runs must not start real clones.
+- A single activation entry (~cloneSystemdService~, ~entryAfter ["reloadSystemd"]~ so the freshly written unit is loaded) triggers ~systemctl --user start --no-block home-git-clone.service~. ~start~, not ~restart~: restart SIGTERMs an in-flight provisioning run (e.g. the login-triggered instance mid-clone), while start joins it, and a completed oneshot without ~RemainAfterExit~ is inactive again so start still re-runs the service on later activations. ~reset-failed~ runs first, because a unit stopped by the start rate limiter refuses further starts for the rest of the ~StartLimitIntervalSec~ window even once the underlying problem is fixed. The trigger *is* gated on ~$DRY_RUN_CMD~ — dry runs must not start real clones.
 - ~Install.WantedBy = ["default.target"]~ as a fallback trigger: if the user bus is unavailable during activation (e.g., ~nixos-rebuild~ before the user session exists), the service still runs at next login. Idempotency makes the extra runs cheap (existence check per repo); note that ~update = true~ repositories consequently also refresh at login.
-- Because the script runs under ~set -eu~ (mirroring Home Manager's activation semantics) and stops at the first failure, a systemd retry re-runs the whole set — idempotency skips completed clones, so retries converge.
+- Because the script runs under ~set -eu~ (mirroring Home Manager's activation semantics) and stops at the first failure, a systemd retry re-runs the whole set — completed repositories are skipped by the existence check, and interrupted clones never reach their final path (see Atomic clone completion below), so retries converge.
 - The preflight stays in activation unconditionally: generations still fail early and loudly when remotes are unreachable; the service only absorbs *transient* failures of the actual transfer.
 
 Complexity check (the constraint was to keep this simple, or defer it): the implementation reuses the existing per-repo script generators verbatim — the DAG entries they return carry the script body in ~.data~, which is concatenated for ~ExecStart~. No generator changes, one new small file, one boolean option. That is within budget, so it ships with this document rather than as a follow-up.
@@ -144,7 +148,11 @@ Complexity check (the constraint was to keep this simple, or defer it): the impl
 
 ** Probe fidelity vs. safety
 
-The probe runs with ~GIT_TERMINAL_PROMPT=0~ but deliberately does *not* force ~GIT_SSH_COMMAND="ssh -o BatchMode=yes"~: overriding the SSH command would diverge from a user's ~core.sshCommand~ and could fail the probe on setups where the real clone would succeed. The 10-second ~timeout~ is the guard against interactive hangs (host-key prompts on non-tty stdin fail immediately anyway).
+The probe runs with ~GIT_TERMINAL_PROMPT=0~ but deliberately does *not* force ~GIT_SSH_COMMAND="ssh -o BatchMode=yes"~: overriding the SSH command would diverge from a user's ~core.sshCommand~ and could fail the probe on setups where the real clone would succeed. The 10-second ~timeout~ is the guard against hangs — including interactive ones: ssh prompts on ~/dev/tty~ rather than stdin, so a host-key or passphrase prompt during a probe is killed at the timeout even when activation runs from a terminal. This is the one accepted probe/clone divergence (the interactive clone would have prompted and possibly succeeded); the rc-124 cause string therefore hints at connecting once manually first. The preflight must stay non-interactive to keep its worst-case time bounded.
+
+** Atomic clone completion
+
+A clone killed mid-transfer (systemd stop, logout without lingering, SIGKILL after ~TimeoutStopSec~) must never leave a torn repository: jj in particular does not clean up its destination on SIGTERM, and a torn ~.jj~ directory would pass the existence check on every later run, silently and permanently. Both clone generators therefore clone into a module-owned sibling directory (~$REPO_PATH.hgc-partial~) and rename into place on completion — atomic on the same filesystem, so the final path either holds a complete repository or nothing. Stale partial directories from killed runs are removed before the next attempt, making interrupted clones self-healing in both execution modes.
 
 ** Why probe skipping is decided at runtime
 
@@ -156,6 +164,7 @@ Whether a repository triggers a network operation depends on local disk state (~
 
 ** File layout
 
+- ~nix/probe.sh~ — the shared ~hgc_probe_url~ function (read into the preflight entry, prepended to the doctor's script).
 - ~nix/preflight.nix~ — preflight activation entry generator (takes both repo sets).
 - ~nix/manifest.nix~ — manifest derivation builder.
 - ~nix/systemd-service.nix~ — service definition + trigger entry for the systemd mode.
@@ -171,7 +180,8 @@ Whether a repository triggers a network operation depends on local disk state (~
   - ~"off"~: no preflight entry generated.
   - Manifest derivation builds and contains both repositories with correct kind/path/bypass values.
   - Systemd mode: per-repo activation entries absent, trigger entry present, unit contains ~Restart=on-failure~ and the concatenated clone script.
-- Doctor app run against a fixture manifest with one public HTTPS repository (probe succeeds without auth) and one bogus URL (fails): table printed, exit code 1; with only the good repository, exit 0. Run with ~SSH_AUTH_SOCK~ masked to model a keyless machine.
+- Doctor app run against a fixture manifest with one public HTTPS repository (probe succeeds without auth) and one bogus URL (fails): table printed, exit code 1; with only the good repository, exit 0. Run with ~SSH_AUTH_SOCK~ masked to model a keyless machine. A pinned but missing branch on a reachable repository must FAIL with the missing-ref cause.
+- Interrupted clone: SIGTERM a ~jj git clone~ of a large local fixture repository mid-transfer (via the generated clone script) at several interruption points; assert the final path does not exist afterwards (only the module-owned partial dir may remain) and that re-running the same script completes the clone. This is the case that previously wedged permanently: jj leaves ~.jj~ behind on SIGTERM, and the existence check then skipped the torn repo forever.
 - ~bash -n~ / shellcheck via ~writeShellApplication~ for the doctor script.
 
 Actually running a full ~home-manager switch~ is out of scope for CI here (matches the project's existing manual-testing stance); activation script content inspection via ~nix eval~ stands in for it.
@@ -206,9 +216,13 @@ Rejected: ~Restart=on-failure~ with a start-rate cap is simpler (no second unit)
 - 2026-07-03: Specification created directly in work-in-progress state; implementation started alongside.
 - 2026-07-03: Implementation complete. Preflight (~nix/preflight.nix~ plus shared ~helpers.repoFacts~), manifest (~nix/manifest.nix~), doctor app (~nix/check.sh~ wired as ~packages~/~apps~/~checks.check~), and the systemd mode (~nix/systemd-service.nix~) all shipped; README.org documents them. Validated with ~nix flake check~ (green, now including the shellcheck-gated doctor build) and a fixture Home Manager flake with one fake git and one fake jj repository: fail/warn/off preflight behaviours executed from the generated activation scripts, manifest content verified, systemd generation built and inspected (unit shape, concatenated clone script, trigger entry, per-repo entries absent), darwin fallback warning confirmed. Doctor app exercised against a fixture manifest with one public HTTPS repository (OK without auth) and one bogus URL (FAIL, exit 1), plus good-only (exit 0), unreadable-manifest and unsupported-version paths. State stays work-in-progress pending review.
 
+- 2026-07-03: Review round 1 (changes-requested) applied on ~agent/preflight-fixes~. Major: interrupted clones could permanently wedge — ~systemctl restart~ SIGTERMed in-flight runs and jj leaves a torn ~.jj~ behind that passed the existence check forever; fixed by cloning into a sibling partial dir with atomic rename (both VCS, both execution modes) and switching the trigger to ~reset-failed~ + ~start --no-block~ with split failure messages. Minors: probe logic extracted into shared ~nix/probe.sh~; pinned revs now probed as ~refs/heads/<rev>~ (preflight and doctor, with ~rev~/~update~/~updateFailMode~ added to the manifest, still version 1); rc-2 and rc-124 causes made diagnosable; manifest placed via ~xdg.configFile~ and the doctor resolves ~XDG_CONFIG_HOME~; ~ripgrep~ added to the app's runtimeInputs; ~pkgs.stdenv.hostPlatform.system~ replaces ~pkgs.system~; ~flake.lock~ committed. Docs updated accordingly (empty-remote limitation, doctor-vs-preflight scope difference, logout hazard, /dev/tty prompt caveat). Validated: ~nix flake check~ green; live interruption fixture — SIGTERM at 5 points mid ~jj git clone~ of a 96MB local repo left the final path absent every time (only the module-owned partial dir), recovery run completed and cleaned the partial, re-run idempotent; preflight executed live showing the missing-ref cause for a pinned bogus branch on a reachable repo; doctor validated against rev-carrying and legacy round-1 manifests (the latter degrading to HEAD probes). One implementation bug was caught by this validation: an empty rev column collapsed under tab-IFS ~read~, shifting fields; the ref is now resolved inside jq.
+- 2026-07-07: Simplification pass over the round-1 branch before merge, then the whole branch conflated into a single commit. Cause extraction now uses ~ripgrep~ (~rg --max-count 1 '\S'~) instead of GNU grep piped into ~head~ -- one tool instead of two, matching the toolchain used everywhere else; the probe builds its environment as a bash array so the bypass and non-bypass paths share a single ~git ls-remote~ invocation instead of duplicating it; the doctor resolves ~bypassGitConfig~ inside jq (like the ref already was) so the read loop stays a plain column capture; and the partial-dir + atomic-rename dance, previously duplicated verbatim in both clone generators, lives in one ~helpers.atomicClone~ helper. Behaviour unchanged; validated with ~nix flake check~ (shellcheck-gated doctor build included) and a doctor run against a fixture manifest.
+
 ** Design Divergence
 
 - The one-line probe cause is taken from the *first* non-empty stderr line, not the last as originally proposed. Running the probes showed git appends generic advice ("and the repository exists.") after the actual error, while the root cause (ssh/curl error) comes first; both the preflight and the doctor app were aligned on first-line extraction.
+- Review round 1 revised the systemd trigger from ~restart --no-block~ (as originally proposed) to ~reset-failed~ + ~start --no-block~, and added atomic clone completion (temp dir + rename) that the original Proposal lacked — the claim that existence-check idempotency alone makes retries converge was falsified by jj's behaviour on SIGTERM. The Proposal sections above were updated to match.
 
 * References
 

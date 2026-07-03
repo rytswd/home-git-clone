@@ -17,7 +17,10 @@ let
     {
       name = path;
       inherit kind;
-      inherit (repo) url;
+      # rev is null when the default branch is auto-detected at clone time;
+      # update/updateFailMode let manifest consumers model which repositories
+      # an activation would actually touch.
+      inherit (repo) url rev update updateFailMode;
       path = facts.repoPath;
       # Effective value (explicit setting or HTTPS auto-detection), so the
       # doctor app reproduces the clone environment without re-implementing
