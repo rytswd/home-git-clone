@@ -204,6 +204,11 @@ Rejected: ~Restart=on-failure~ with a start-rate cap is simpler (no second unit)
 * History
 
 - 2026-07-03: Specification created directly in work-in-progress state; implementation started alongside.
+- 2026-07-03: Implementation complete. Preflight (~nix/preflight.nix~ plus shared ~helpers.repoFacts~), manifest (~nix/manifest.nix~), doctor app (~nix/check.sh~ wired as ~packages~/~apps~/~checks.check~), and the systemd mode (~nix/systemd-service.nix~) all shipped; README.org documents them. Validated with ~nix flake check~ (green, now including the shellcheck-gated doctor build) and a fixture Home Manager flake with one fake git and one fake jj repository: fail/warn/off preflight behaviours executed from the generated activation scripts, manifest content verified, systemd generation built and inspected (unit shape, concatenated clone script, trigger entry, per-repo entries absent), darwin fallback warning confirmed. Doctor app exercised against a fixture manifest with one public HTTPS repository (OK without auth) and one bogus URL (FAIL, exit 1), plus good-only (exit 0), unreadable-manifest and unsupported-version paths. State stays work-in-progress pending review.
+
+** Design Divergence
+
+- The one-line probe cause is taken from the *first* non-empty stderr line, not the last as originally proposed. Running the probes showed git appends generic advice ("and the repository exists.") after the actual error, while the root cause (ssh/curl error) comes first; both the preflight and the doctor app were aligned on first-line extraction.
 
 * References
 
