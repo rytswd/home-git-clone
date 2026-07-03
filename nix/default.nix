@@ -13,6 +13,7 @@ let
   helpers = import ./helpers.nix { inherit lib config pkgs; };
   preflightEntry = import ./preflight.nix { inherit lib pkgs helpers; };
   manifestFile = import ./manifest.nix { inherit lib pkgs helpers; };
+  systemdService = import ./systemd-service.nix { inherit lib pkgs; };
   gitCloneRepoScript = import ./git-clone.nix {
     inherit
       lib
@@ -29,6 +30,13 @@ let
       helpers
       ;
   };
+
+  cloneEntries =
+    (lib.mapAttrsToList gitCloneRepoScript gitCfg) ++ (lib.mapAttrsToList jjCloneRepoScript jjCfg);
+
+  # The systemd mode is Linux-only; other platforms fall back to inline
+  # execution so a configuration shared across machines stays portable.
+  useSystemdService = config.home.cloneUseSystemdService && pkgs.stdenv.isLinux;
 
   gitRepoModule = { lib, ... }: {
     options = {
@@ -223,6 +231,23 @@ in
     '';
   };
 
+  options.home.cloneUseSystemdService = lib.mkOption {
+    type = lib.types.bool;
+    default = false;
+    description = ''
+      Run the clone/update operations in a systemd user service
+      (home-git-clone.service) instead of inline during activation.
+
+      The service is triggered by activation (and at login as a fallback)
+      and retries on failure with a bounded backoff, so transient network
+      flakes no longer fail the Home Manager generation. The remote
+      preflight (home.cloneVerifyRemotes) still runs during activation.
+
+      Linux-only; ignored with a warning on other platforms. Requires
+      systemd >= 244 (Restart=on-failure for oneshot units).
+    '';
+  };
+
   options.home.jjClone = lib.mkOption {
     type = lib.types.attrsOf (lib.types.submodule jjRepoModule);
     default = { };
@@ -278,19 +303,29 @@ in
 
   config = lib.mkMerge [
     (lib.mkIf (gitCfg != { }) {
-      home.activation = lib.listToAttrs (lib.mapAttrsToList gitCloneRepoScript gitCfg);
       assertions = lib.mapAttrsToList (name: repo: {
         assertion = repo.useWorktree -> repo.rev != null;
         message = "home.gitClone.\"${name}\": useWorktree requires rev to be explicitly set (cannot auto-detect in worktree mode)";
       }) gitCfg;
     })
     (lib.mkIf (jjCfg != { }) {
-      home.activation = lib.listToAttrs (lib.mapAttrsToList jjCloneRepoScript jjCfg);
       assertions = lib.mapAttrsToList (name: repo: {
         assertion = repo.useWorkspace -> repo.rev != null;
         message = "home.jjClone.\"${name}\": useWorkspace requires rev to be explicitly set (cannot auto-detect in workspace mode)";
       }) jjCfg;
     })
+    (lib.mkIf (anyRepos && !useSystemdService) {
+      home.activation = lib.listToAttrs cloneEntries;
+    })
+    (lib.mkIf (anyRepos && useSystemdService) (
+      let
+        sd = systemdService { inherit cloneEntries; };
+      in
+      {
+        home.activation = lib.listToAttrs [ sd.triggerEntry ];
+        systemd.user.services.home-git-clone = sd.service;
+      }
+    ))
     (lib.mkIf (anyRepos && config.home.cloneVerifyRemotes != "off") {
       home.activation.cloneVerifyRemotes = preflightEntry {
         gitRepos = gitCfg;
@@ -306,6 +341,11 @@ in
         gitRepos = gitCfg;
         jjRepos = jjCfg;
       };
+    })
+    (lib.mkIf (config.home.cloneUseSystemdService && !pkgs.stdenv.isLinux) {
+      warnings = [
+        "home.cloneUseSystemdService is Linux-only; clones run inline during activation on this platform."
+      ];
     })
   ];
 }
