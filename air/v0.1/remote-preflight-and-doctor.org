@@ -1,0 +1,214 @@
+#+title: Remote Preflight, Repo Manifest Doctor, and Systemd Clone Execution
+#+state: work-in-progress
+#+FILETAGS: :nix:home-manager:git:jujutsu:vcs:feature:reliability:
+#+date: 2026-07-03
+
+* Summary
+
+Make repository clone failures early, atomic, aggregated, and diagnosable. Today a single unreachable remote hard-fails the Home Manager generation midway through activation, after other mutations have begun, with a raw git error for only the first repository that failed. This document adds three capabilities: (1) a *preflight probe* that verifies every configured remote before any activation mutation and aggregates all failures into one report, (2) a *manifest + doctor app* that renders the configured repository set as JSON and provides an ad hoc ~nix run~ command to probe it on any machine, and (3) an *optional systemd execution mode* that moves clone execution into a oneshot user service with bounded retries so transient network flakes stop failing generations.
+
+* Motivation
+
+** Problem
+
+A host without working VCS authentication (e.g., a fresh machine whose SSH key arrives later via a secrets service) runs ~home-manager switch~. The clone step hard-fails mid-activation on the *first* configured repository, failing the whole ~home-manager-<user>~ generation with a raw git error, after other mutations (file writes, etc.) have already begun. Failure is desired — missing repositories should be loud — but the current failure mode is:
+
+- *Late*: it happens after ~writeBoundary~, once mutations have started, so a failed generation leaves a half-activated state.
+- *Non-atomic*: unrelated activation work is interleaved with the failure.
+- *Partial*: only the first unreachable remote is reported; the user fixes one, re-runs, and hits the next.
+- *Hard to diagnose*: a raw ~git clone~ error buried in activation output, with no summary of which repositories/URLs were checked.
+- *Not checkable ad hoc*: there is no way to ask "would this machine be able to clone everything?" without actually running an activation.
+
+** Solution
+
+Three additions, layered from cheapest to most involved:
+
+1. *Preflight probe*: a single activation entry ordered ~before writeBoundary~ that runs ~git ls-remote --exit-code <url> HEAD~ (with a short timeout) for every configured repository across both ~home.gitClone~ and ~home.jjClone~, aggregates *all* failures into one clear report (repo, url, one-line cause), and aborts activation before any mutation. It is deliberately not gated on ~$DRY_RUN_CMD~, so ~home-manager switch --dry-run~ becomes a genuine preflight.
+2. *Manifest + doctor app*: the configured repository set (name, kind, url, target path) is rendered as JSON into the generation and linked at ~~/.config/home-git-clone/manifest.json~. A new flake app, ~nix run github:rytswd/home-git-clone#check~, reads the live manifest, runs the same probes, prints a table, and exits 0/1. This works on any machine with Nix — including probing a deploy target before switching it.
+3. *Optional systemd execution mode*: a boolean option (default off) that, on Linux, moves *clone execution* (not the preflight) into a oneshot user service triggered by activation, with ~Restart=on-failure~ and a sane retry cap. Activation still fails on preflight; clone retries stop transient network flakes from failing generations.
+
+* Goals
+
+- Fail *before* ~writeBoundary~ so an unreachable remote aborts activation before any mutation.
+- Report *all* unreachable remotes at once — repo name, url, and a one-line cause each.
+- Cover both ~home.gitClone~ and ~home.jjClone~ (jj clones use git remotes, so the same probe applies).
+- Probe with the same environment the clone would use (git-config bypass, GPG agent SSH socket) so the probe's verdict predicts the clone's outcome.
+- Keep dry-run useful: preflight runs on ~--dry-run~ too.
+- Support bootstrap flows via a ~"warn"~ mode that prints the report but continues (e.g., keys placed by a secrets service after first activation).
+- Ad hoc checkability via ~nix run github:rytswd/home-git-clone#check~ against the live manifest, with no configuration required on the probing side.
+- Optional decoupling of clone execution from the activation transcript via systemd, kept deliberately simple (one boolean).
+
+* Non-Goals
+
+- No forge-specific APIs or CLIs — probes are plain ~git ls-remote~, working with any git remote.
+- No probe deduplication for repositories sharing a URL (harmless double probe; revisit if configs with many duplicate URLs appear).
+- No verification that an *existing* local repository matches its configured URL (existing "No URL Validation on Existing Repos" limitation stands).
+- No parallel probing — configs have dozens of repos at most, and sequential probes keep output ordering deterministic.
+- The systemd mode does not attempt to reflect clone failures back into the activation exit code — that is exactly the coupling it exists to remove.
+
+* Proposal
+
+** Option Schema
+
+Two new module-level options, following the existing camelCase style under ~home.~ and sharing a ~clone~ prefix since they apply to both ~home.gitClone~ and ~home.jjClone~:
+
+#+begin_src nix
+home.cloneVerifyRemotes = "fail" | "warn" | "off";  # Default: "fail"
+home.cloneUseSystemdService = bool;                 # Default: false
+#+end_src
+
+- ~cloneVerifyRemotes = "fail"~ (default): probe all configured remotes before ~writeBoundary~; on any failure, print the aggregated report and abort activation.
+- ~cloneVerifyRemotes = "warn"~: print the same report but continue. Intended for bootstrap flows where credentials arrive after first activation (e.g., a secrets service places the SSH key once the user session exists) — the first switch proceeds, and repositories appear on a later one.
+- ~cloneVerifyRemotes = "off"~: no preflight entry is generated at all.
+- ~cloneUseSystemdService = true~: on Linux, clone execution moves into a oneshot user service (see below). On non-Linux platforms the option is ignored with a warning and clones run inline as before, keeping shared configurations portable.
+
+The manifest is always rendered when any repository is configured — it is inert data and the doctor app depends on it, so there is no knob for it.
+
+** Preflight Probe
+
+A single activation entry, ~cloneVerifyRemotes~, registered via ~lib.hm.dag.entryBefore ["writeBoundary"]~ (generated in a new ~nix/preflight.nix~):
+
+1. Sets up ~PATH~ (git, openssh, coreutils) and the GPG agent SSH socket exactly like the clone scripts do.
+2. For each configured repository (git and jj), decides at runtime whether the activation would perform a *fatal* network operation, and skips the probe otherwise:
+   - Target missing (no ~.git~ / ~.jj~ directory) → clone will run → probe.
+   - Target present and ~update = true~ with ~updateFailMode = "error"~ → pull/fetch failure would fail activation → probe.
+   - Target present otherwise → no fatal network operation → skip. This keeps a fully-cloned machine activatable while offline.
+3. Probes with ~timeout 10 git ls-remote --exit-code "<url>" HEAD~, under ~GIT_TERMINAL_PROMPT=0~ (a credential prompt must fail fast, not sit under the timeout) and the same per-repository git-config bypass the clone would use.
+4. Collects every failure (repo name, kind, url, one-line cause taken from the probe's last stderr line, or "timed out after 10s" on exit 124).
+5. If anything failed: prints the aggregated report to stderr, then exits 1 (~"fail"~) or continues with a notice (~"warn"~).
+
+The probe commands are intentionally *not* prefixed with ~$DRY_RUN_CMD~: probes mutate nothing, and running them during ~--dry-run~ is the feature — a dry run becomes a real preflight for the target machine.
+
+Report shape (one block per failure, aggregated):
+
+#+begin_example
+home-git-clone: remote preflight failed for 2 of 5 repositories:
+  - Coding/dotfiles (git)
+      url:   git@github.com:user/dotfiles.git
+      cause: git@github.com: Permission denied (publickey).
+  - Coding/notes (jj)
+      url:   git@github.com:user/notes.git
+      cause: timed out after 10s
+Aborting before any changes were made (home.cloneVerifyRemotes = "fail").
+#+end_example
+
+** Manifest
+
+A new ~nix/manifest.nix~ renders the full configured repository set to JSON via ~pkgs.writeText~, linked through ~home.file~ at ~~/.config/home-git-clone/manifest.json~ so the live symlink always describes the current generation:
+
+#+begin_src json
+{
+  "version": 1,
+  "repos": [
+    {
+      "name": "Coding/dotfiles",
+      "kind": "git",
+      "url": "git@github.com:user/dotfiles.git",
+      "path": "/home/user/Coding/dotfiles",
+      "bypassGitConfig": false
+    }
+  ]
+}
+#+end_src
+
+- ~name~ is the attribute path as configured; ~kind~ is ~"git"~ or ~"jj"~; ~path~ is the absolute target (worktree/workspace expansion applied).
+- ~bypassGitConfig~ is the *effective* boolean (explicit setting, or HTTPS auto-detection), so the doctor app can reproduce the clone environment without re-implementing the detection.
+- ~version~ allows the doctor app to reject manifests from incompatible future schemas.
+- Nix attribute iteration is name-sorted, so the manifest is deterministic.
+
+** Doctor App
+
+New flake outputs: ~packages.<system>.check~ (a ~writeShellApplication~, so shellcheck gates the build), ~apps.<system>.check~ pointing at it, and ~checks.<system>.check~ building it so ~nix flake check~ exercises the script.
+
+#+begin_src bash
+nix run github:rytswd/home-git-clone#check              # reads ~/.config/home-git-clone/manifest.json
+nix run github:rytswd/home-git-clone#check -- FILE.json # explicit manifest (e.g., copied from a target host)
+#+end_src
+
+Behaviour: parse the manifest with jq, run the same ~timeout 10 git ls-remote --exit-code <url> HEAD~ probe per repository (honouring ~bypassGitConfig~), print a table ~repo | url | status~ with per-failure causes below it, exit 0 if all reachable, 1 otherwise (including unreadable/unsupported manifest). Deploy-time use: fetch the target host's manifest (or evaluate it locally) and run the doctor *before* switching the host, from any machine with Nix.
+
+** Systemd Execution Mode
+
+When ~home.cloneUseSystemdService = true~ on Linux:
+
+- The per-repository activation entries are *not* generated. Instead the same generated per-repo scripts (with ~DRY_RUN_CMD~ empty — a systemd unit has no dry-run concept) are concatenated into a single script run by a oneshot user service, ~home-git-clone.service~.
+- Unit shape: ~Type=oneshot~, ~Restart=on-failure~, ~RestartSec=30~, capped by ~StartLimitIntervalSec=600~ / ~StartLimitBurst=5~ (5 attempts in 10 minutes, then systemd gives up until the next trigger). ~Restart=on-failure~ is valid for oneshot units on systemd ≥ 244; oneshot units are never restarted on clean exit.
+- A single activation entry (~cloneSystemdService~, ~entryAfter ["reloadSystemd"]~ so the freshly written unit is loaded) triggers ~systemctl --user restart --no-block home-git-clone.service~. The trigger *is* gated on ~$DRY_RUN_CMD~ — dry runs must not start real clones.
+- ~Install.WantedBy = ["default.target"]~ as a fallback trigger: if the user bus is unavailable during activation (e.g., ~nixos-rebuild~ before the user session exists), the service still runs at next login. Idempotency makes the extra runs cheap (existence check per repo); note that ~update = true~ repositories consequently also refresh at login.
+- Because the script runs under ~set -eu~ (mirroring Home Manager's activation semantics) and stops at the first failure, a systemd retry re-runs the whole set — idempotency skips completed clones, so retries converge.
+- The preflight stays in activation unconditionally: generations still fail early and loudly when remotes are unreachable; the service only absorbs *transient* failures of the actual transfer.
+
+Complexity check (the constraint was to keep this simple, or defer it): the implementation reuses the existing per-repo script generators verbatim — the DAG entries they return carry the script body in ~.data~, which is concatenated for ~ExecStart~. No generator changes, one new small file, one boolean option. That is within budget, so it ships with this document rather than as a follow-up.
+
+* Design Details
+
+** Probe fidelity vs. safety
+
+The probe runs with ~GIT_TERMINAL_PROMPT=0~ but deliberately does *not* force ~GIT_SSH_COMMAND="ssh -o BatchMode=yes"~: overriding the SSH command would diverge from a user's ~core.sshCommand~ and could fail the probe on setups where the real clone would succeed. The 10-second ~timeout~ is the guard against interactive hangs (host-key prompts on non-tty stdin fail immediately anyway).
+
+** Why probe skipping is decided at runtime
+
+Whether a repository triggers a network operation depends on local disk state (~.git~ / ~.jj~ presence), which Nix cannot see at evaluation time. The preflight script therefore performs the same existence checks the clone scripts do, per repository, at activation time.
+
+** Why the timeout is fixed
+
+10 seconds per probe is enough for any healthy remote and keeps worst-case preflight time bounded (~10s x unreachable repos). A configurable timeout was considered and rejected to keep the option surface minimal; it can be added later without breaking anything.
+
+** File layout
+
+- ~nix/preflight.nix~ — preflight activation entry generator (takes both repo sets).
+- ~nix/manifest.nix~ — manifest derivation builder.
+- ~nix/systemd-service.nix~ — service definition + trigger entry for the systemd mode.
+- ~nix/default.nix~ — new options, wiring, non-Linux warning for the systemd mode.
+- ~flake.nix~ — ~packages.check~ / ~apps.check~ / ~checks.check~.
+
+* Test Plan
+
+- ~nix flake check~ stays green (now also builds the doctor app, including its shellcheck gate).
+- Fixture Home Manager configuration with two fake repositories (one git, one jj):
+  - ~cloneVerifyRemotes = "fail"~: activation entry exists, ordered ~before writeBoundary~, contains both probes and ~exit 1~ on failure.
+  - ~"warn"~: same report, no abort path.
+  - ~"off"~: no preflight entry generated.
+  - Manifest derivation builds and contains both repositories with correct kind/path/bypass values.
+  - Systemd mode: per-repo activation entries absent, trigger entry present, unit contains ~Restart=on-failure~ and the concatenated clone script.
+- Doctor app run against a fixture manifest with one public HTTPS repository (probe succeeds without auth) and one bogus URL (fails): table printed, exit code 1; with only the good repository, exit 0. Run with ~SSH_AUTH_SOCK~ masked to model a keyless machine.
+- ~bash -n~ / shellcheck via ~writeShellApplication~ for the doctor script.
+
+Actually running a full ~home-manager switch~ is out of scope for CI here (matches the project's existing manual-testing stance); activation script content inspection via ~nix eval~ stands in for it.
+
+* Drawbacks
+
+1. *Preflight adds latency*: one ~ls-remote~ round-trip per repository needing network work, on every activation. Bounded by the 10s timeout; healthy remotes answer in well under a second.
+2. *Probe/clone divergence is still possible*: ~ls-remote~ succeeding does not guarantee the clone succeeds (e.g., disk full, ref disappearing mid-flight). The preflight narrows the failure window; it cannot eliminate it.
+3. *Manifest duplicates configuration*: the JSON restates what Nix already knows. Accepted so that probing requires no Nix evaluation on the probing machine.
+4. *Systemd mode trades visibility for resilience*: clone output moves from the activation transcript to the journal (~journalctl --user -u home-git-clone~).
+
+* Alternatives
+
+** Per-repository verify option instead of a module-level knob
+
+Rejected: the failure being addressed is machine-level (no credentials, no network), not repo-level. A module-level enum keeps one decision in one place; per-repo overrides can be layered on later if a real need appears.
+
+** Probing at Nix evaluation time
+
+Rejected: evaluation must stay pure and offline. Probes belong to activation (preflight) and ad hoc tooling (doctor).
+
+** Doctor app evaluating the flake instead of reading a manifest
+
+Rejected: would require the user's full Home Manager configuration (and its secrets/inputs) on the probing machine. A generation-linked JSON file makes the live config portable and greppable.
+
+** Timer-based systemd retries instead of Restart=on-failure
+
+Rejected: ~Restart=on-failure~ with a start-rate cap is simpler (no second unit), and the login-time ~WantedBy~ fallback already covers "much later" retries.
+
+* History
+
+- 2026-07-03: Specification created directly in work-in-progress state; implementation started alongside.
+
+* References
+
+- [[file:initialise-home-git-clone.org][home.gitClone implementation]]
+- [[file:jjclone-option.org][home.jjClone implementation]]
+- [[file:../../nix/default.nix][Module options (nix/default.nix)]]
+- [[file:../../nix/helpers.nix][Shared helpers (nix/helpers.nix)]]
+- [[file:../../README.org][User documentation]]
